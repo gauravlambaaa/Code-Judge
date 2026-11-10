@@ -1,0 +1,12 @@
+# build output
+/bin/
+*.exe
+
+# local config (copy .env.example to .env)
+.env
+
+# editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,8 @@
+{
+  "title": "Sum of two numbers",
+  "time_limit_ms": 2000,
+  "memory_limit_mb": 256,
+  "test_cases": [
+    { "input": "2 3\n", "expected_output": "5\n" }
+  ]
+}
