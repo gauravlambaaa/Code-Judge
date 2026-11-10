@@ -69,9 +69,12 @@ func (w *Worker) process(ctx context.Context, job *store.Job) {
 
 	// Step 1 judges only the first test case. Step 6 runs all of them.
 	tc := tests[0]
-	timeLimit := time.Duration(problem.TimeLimitMs) * time.Millisecond
+	limits := judge.Limits{
+		Time:     time.Duration(problem.TimeLimitMs) * time.Millisecond,
+		MemoryMB: problem.MemoryLimitMb,
+	}
 
-	res, err := judge.Judge(ctx, job.Language, job.SourceCode, tc.Input, tc.ExpectedOutput, timeLimit)
+	res, err := judge.Judge(ctx, job.Language, job.SourceCode, tc.Input, tc.ExpectedOutput, limits)
 	if err != nil {
 		log.Printf("worker %s: judging %s failed: %v", w.id, job.ID, err)
 		return
