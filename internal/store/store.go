@@ -23,6 +23,10 @@ type Store struct {
 	// it running. It's zero normally; the Step 4 race demo sets it (via
 	// CLAIM_DELAY_MS) to make the race window wide enough to see.
 	ClaimDelay time.Duration
+
+	// UnsafeClaim switches ClaimNextPending back to the Step 1 version,
+	// which has the race. Only for showing the race (UNSAFE_CLAIM=1).
+	UnsafeClaim bool
 }
 
 func New(pool *pgxpool.Pool) *Store {
@@ -127,13 +131,75 @@ func (s *Store) GetSubmission(ctx context.Context, id string) (Submission, error
 }
 
 // ClaimNextPending takes the oldest pending submission and marks it as
-// running under workerID. It returns nil when the queue is empty.
-//
-// STEP 1 VERSION: this is only correct while there is a single worker.
-// The SELECT and the UPDATE are two separate statements with nothing locking
-// the row in between, so two workers can both find the same pending job
-// before either marks it running. Step 4: you rewrite this function.
+// running under workerID. It returns nil when there's nothing to claim.
+// It's safe with any number of workers calling it at the same moment.
 func (s *Store) ClaimNextPending(ctx context.Context, workerID string) (*Job, error) {
+	if s.UnsafeClaim {
+		return s.claimNextPendingUnsafe(ctx, workerID)
+	}
+
+	// Everything below happens inside one transaction, on one connection.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// If we return before Commit (an error, or nothing to claim), this ends
+	// the transaction and releases any lock we hold. After a Commit it does
+	// nothing.
+	defer tx.Rollback(ctx)
+
+	var j Job
+	// FOR UPDATE: lock the row we pick until this transaction ends.
+	// SKIP LOCKED: if another worker has already locked a row, don't wait
+	// for it; pass over it and take the next free one.
+	// Note tx.QueryRow, not s.pool.QueryRow: the pool would run this on a
+	// different connection, outside our transaction.
+	err = tx.QueryRow(ctx,
+		`SELECT id, problem_id, language, source_code
+		 FROM submissions
+		 WHERE status = 'pending'
+		 ORDER BY created_at
+		 LIMIT 1
+		 FOR UPDATE SKIP LOCKED`,
+	).Scan(&j.ID, &j.ProblemID, &j.Language, &j.SourceCode)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil // every pending row is taken or locked by someone else
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Race demo: the same pause as the unsafe version. Here it's harmless,
+	// because we hold the row's lock: every other worker skips this row.
+	time.Sleep(s.ClaimDelay)
+
+	// Still inside the transaction, so still holding the lock: mark the job
+	// taken. When COMMIT releases the lock a moment later, the row already
+	// says 'running', so no worker's "WHERE status = 'pending'" can match it
+	// again. The lock covers the gap; the UPDATE makes the claim permanent.
+	_, err = tx.Exec(ctx,
+		`UPDATE submissions
+		 SET status = 'running', worker_id = $2, updated_at = now()
+		 WHERE id = $1`,
+		j.ID, workerID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return &j, nil
+}
+
+// claimNextPendingUnsafe is the Step 1 version, kept only so the race can be
+// shown side by side with the fix (UNSAFE_CLAIM=1). Never use it for real.
+//
+// The SELECT and the UPDATE are two separate statements on whatever
+// connection the pool hands out, with nothing locking the row in between.
+// So two workers can both find the same pending job before either marks it
+// running, and both judge it.
+func (s *Store) claimNextPendingUnsafe(ctx context.Context, workerID string) (*Job, error) {
 	var j Job
 	err := s.pool.QueryRow(ctx,
 		`SELECT id, problem_id, language, source_code

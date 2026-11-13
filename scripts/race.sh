@@ -7,6 +7,7 @@
 #   bash scripts/race.sh                       # 3 workers, 24 jobs
 #   CLAIM_DELAY_MS=200 bash scripts/race.sh    # widen the race window
 #   WORKERS=5 JOBS=40 bash scripts/race.sh
+#   UNSAFE_CLAIM=1 bash scripts/race.sh        # the old Step 1 query, to see the race
 #
 # Worker logs end up in /tmp/judge-worker-1.log, -2.log, ...
 set -euo pipefail
@@ -53,7 +54,8 @@ for _ in $(seq 1 "$JOBS"); do
   JUDGE_URL=$API bash scripts/submit.sh "$PROBLEM" python testdata/sum/ac.py > /dev/null
 done
 
-echo "Starting $WORKERS workers (CLAIM_DELAY_MS=$CLAIM_DELAY_MS)..."
+if [ "${UNSAFE_CLAIM:-}" = 1 ]; then query="UNSAFE Step 1 claim query"; else query="FOR UPDATE SKIP LOCKED claim query"; fi
+echo "Starting $WORKERS workers ($query, CLAIM_DELAY_MS=$CLAIM_DELAY_MS)..."
 for i in $(seq 1 "$WORKERS"); do
   /tmp/judge-worker > "/tmp/judge-worker-$i.log" 2>&1 &
   PIDS+=($!)

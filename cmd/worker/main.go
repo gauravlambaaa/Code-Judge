@@ -56,6 +56,12 @@ func main() {
 		st.ClaimDelay = time.Duration(ms) * time.Millisecond
 		log.Printf("worker: pausing %v inside every claim (race demo)", st.ClaimDelay)
 	}
+	// Race demo only: UNSAFE_CLAIM=1 uses the Step 1 claim query, which has
+	// the race, so you can compare it with the fixed one.
+	if os.Getenv("UNSAFE_CLAIM") == "1" {
+		st.UnsafeClaim = true
+		log.Print("worker: using the UNSAFE Step 1 claim query (race demo)")
+	}
 
 	worker.New(st, worker.DefaultID()).Run(ctx)
 
