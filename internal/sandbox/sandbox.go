@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -22,10 +23,27 @@ const (
 	// this grace only controls when we stop waiting.
 	startupGrace = 2 * time.Second
 
+	// After we ask Docker to kill a container, we wait at most this long for
+	// it to actually stop. A container thrashing at its memory limit (a
+	// Python fork bomb does this) can take 20+ seconds just to die, and the
+	// worker must never be stuck that long on one submission.
+	killWait = 5 * time.Second
+
 	// We keep at most this much stdout or stderr. Without a cap, a program
 	// running `while True: print(1)` would fill the worker's memory.
 	maxOutput = 1 << 20 // 1 MB
 )
+
+// backgroundRemovals counts containers still being removed in the
+// background, so the program can wait for them before it exits.
+var backgroundRemovals sync.WaitGroup
+
+// WaitForCleanup blocks until every background container removal has
+// finished. Call it before the program exits, so no containers are left
+// behind.
+func WaitForCleanup() {
+	backgroundRemovals.Wait()
+}
 
 // Spec describes one program run.
 type Spec struct {
@@ -42,7 +60,7 @@ type Result struct {
 	Stdout    string
 	Stderr    string
 	ExitCode  int
-	Elapsed   time.Duration // the program's running time, from Docker's own start/finish timestamps
+	Elapsed   time.Duration // the program's running time, from Docker's own start/finish timestamps (or our own clock if it wouldn't die)
 	Killed    bool          // we killed it because it was still running at the deadline
 	OOMKilled bool          // the kernel killed it for going over the memory limit
 }
@@ -88,8 +106,19 @@ func Run(ctx context.Context, spec Spec) (Result, error) {
 	}
 	args = append(args, spec.Cmd...)
 
-	// However we leave this function, the container gets removed.
-	defer removeContainer(name)
+	// However we leave this function, the container gets removed. Normally
+	// that takes a few milliseconds and happens right here. If the container
+	// refused to die in time (see killWait), the removal happens in the
+	// background instead, so the worker can move on to the next job.
+	removeInBackground := false
+	defer func() {
+		if removeInBackground {
+			// WaitGroup.Go starts the goroutine and counts it until it returns.
+			backgroundRemovals.Go(func() { removeContainer(name, 2*time.Minute) })
+		} else {
+			removeContainer(name, 30*time.Second)
+		}
+	}()
 
 	// Note: exec.Command, not exec.CommandContext. Killing this process only
 	// kills the docker CLI on our side; the container would keep running.
@@ -101,6 +130,7 @@ func Run(ctx context.Context, spec Spec) (Result, error) {
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 
+	start := time.Now()
 	if err := cmd.Start(); err != nil {
 		return Result{}, fmt.Errorf("start docker: %w", err)
 	}
@@ -121,11 +151,17 @@ func Run(ctx context.Context, spec Spec) (Result, error) {
 	case <-exited:
 	case <-deadline.C:
 		res.Killed = true
-		killContainer(name)
-		<-exited
+		if !killAndWait(name, exited) {
+			// Still not dead. It's over the time limit whatever happens next,
+			// so report that now and leave the cleanup to the background.
+			// (We don't read stdout/stderr here: the docker CLI may still be
+			// writing into them.)
+			removeInBackground = true
+			res.Elapsed = time.Since(start)
+			return res, nil
+		}
 	case <-ctx.Done():
-		killContainer(name)
-		<-exited
+		killAndWait(name, exited)
 		return Result{}, ctx.Err()
 	}
 
@@ -180,16 +216,31 @@ func inspect(name string) (containerState, error) {
 	return s, nil
 }
 
+// killAndWait asks Docker to kill the container, then waits up to killWait
+// for it to stop. It reports whether it stopped in time.
+func killAndWait(name string, exited <-chan struct{}) bool {
+	// `docker kill` itself can take many seconds on a thrashing container,
+	// so run it in the background and wait on the container instead.
+	go killContainer(name)
+	select {
+	case <-exited:
+		return true
+	case <-time.After(killWait):
+		return false
+	}
+}
+
 // killContainer sends SIGKILL to everything in the container. An error just
 // means it had already stopped, so it's ignored.
 func killContainer(name string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	exec.CommandContext(ctx, "docker", "kill", name).Run()
 }
 
-func removeContainer(name string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+// removeContainer force-removes the container (killing it first if needed).
+func removeContainer(name string, timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	exec.CommandContext(ctx, "docker", "rm", "-f", name).Run()
 }

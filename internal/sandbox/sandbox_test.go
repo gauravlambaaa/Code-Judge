@@ -52,6 +52,7 @@ for f in ["memory.max", "memory.swap.max", "cpu.max", "pids.max"]:
 print("uid", os.getuid())
 print("net", sorted(os.listdir("/sys/class/net")))
 `, 5*time.Second, 128)
+	t.Logf("what the program saw from inside the container:\n%s", res.Stdout)
 
 	want := []string{
 		"memory.max 134217728",  // 128 MB in bytes
@@ -109,5 +110,24 @@ func TestOutputIsCapped(t *testing.T) {
 	res := runPython(t, "import sys\nwhile True: sys.stdout.write('x' * 65536)\n", 1*time.Second, 128)
 	if len(res.Stdout) != maxOutput {
 		t.Errorf("len(Stdout) = %d, want %d", len(res.Stdout), maxOutput)
+	}
+}
+
+// A Python fork bomb fills the memory limit with 64 processes and thrashes,
+// which can make the container take 20+ seconds to die. Run must still
+// return soon after the deadline instead of waiting for it.
+func TestForkBombDoesNotHoldTheWorker(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow: waits for a thrashing container to be cleaned up")
+	}
+	// Run returns quickly, but the container may still be dying in the
+	// background. Wait for it at the end so the test leaves nothing behind.
+	t.Cleanup(WaitForCleanup)
+
+	start := time.Now()
+	runPython(t, "import os\nwhile True:\n    os.fork()\n", 1*time.Second, 256)
+	limit := 1*time.Second + startupGrace + killWait + 3*time.Second // 3 s of slack for Docker itself
+	if took := time.Since(start); took > limit {
+		t.Errorf("Run took %v, want at most %v", took, limit)
 	}
 }

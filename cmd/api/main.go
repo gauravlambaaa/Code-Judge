@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"codejudge/internal/api"
+	"codejudge/internal/sandbox"
 	"codejudge/internal/store"
 	"codejudge/internal/worker"
 )
@@ -72,5 +73,8 @@ func main() {
 		log.Fatalf("api: %v", err)
 	}
 	<-workerDone
+	// Containers that were slow to die are removed in the background;
+	// wait for those so none are left behind.
+	sandbox.WaitForCleanup()
 	log.Print("api: stopped")
 }
