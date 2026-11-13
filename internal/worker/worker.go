@@ -3,23 +3,44 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"time"
 
 	"codejudge/internal/judge"
+	"codejudge/internal/sandbox"
 	"codejudge/internal/store"
 )
+
+// MaxAttempts is how many times a job may be claimed. If every one of those
+// workers vanishes mid-job (the job crashes whatever runs it, say), the job
+// is marked 'failed' instead of being retried forever.
+const MaxAttempts = 3
 
 type Worker struct {
 	store        *store.Store
 	id           string
 	pollInterval time.Duration
+
+	// lease is how long a claim lasts without a heartbeat. heartbeatEvery
+	// is a third of it, so two heartbeats in a row can fail (a database
+	// blip, a slow moment) before the lease actually runs out.
+	lease          time.Duration
+	heartbeatEvery time.Duration
+
+	lastOrphanSweep time.Time
 }
 
-func New(st *store.Store, id string) *Worker {
-	return &Worker{store: st, id: id, pollInterval: time.Second}
+func New(st *store.Store, id string, lease time.Duration) *Worker {
+	return &Worker{
+		store:          st,
+		id:             id,
+		pollInterval:   time.Second,
+		lease:          lease,
+		heartbeatEvery: lease / 3,
+	}
 }
 
 // DefaultID names a worker "<hostname>-<pid>". That's unique for every worker
@@ -33,18 +54,20 @@ func DefaultID() string {
 }
 
 // Run claims and judges submissions one at a time until ctx is cancelled.
-// When the queue is empty it waits pollInterval before checking again.
+// When there's nothing to claim it waits pollInterval before checking again.
 func (w *Worker) Run(ctx context.Context) {
-	log.Printf("worker %s: started", w.id)
+	log.Printf("worker %s: started (lease %v, heartbeat every %v)", w.id, w.lease, w.heartbeatEvery)
 	for ctx.Err() == nil {
-		job, err := w.store.ClaimNextPending(ctx, w.id)
+		w.cleanUpAfterDeadWorkers(ctx)
+
+		job, err := w.store.ClaimNextPending(ctx, w.id, w.lease, MaxAttempts)
 		if err != nil {
 			log.Printf("worker %s: claim failed: %v", w.id, err)
 			sleep(ctx, w.pollInterval)
 			continue
 		}
 		if job == nil {
-			sleep(ctx, w.pollInterval) // queue is empty
+			sleep(ctx, w.pollInterval) // nothing to do
 			continue
 		}
 		w.process(ctx, job)
@@ -52,45 +75,125 @@ func (w *Worker) Run(ctx context.Context) {
 	log.Printf("worker %s: stopped", w.id)
 }
 
+// cleanUpAfterDeadWorkers is housekeeping that any worker can do, so that a
+// worker that crashes never leaves a mess behind forever.
+func (w *Worker) cleanUpAfterDeadWorkers(ctx context.Context) {
+	// Jobs whose last allowed attempt also died: give up on them.
+	if n, err := w.store.FailExhausted(ctx, MaxAttempts); err != nil {
+		log.Printf("worker %s: marking exhausted jobs failed: %v", w.id, err)
+	} else if n > 0 {
+		log.Printf("worker %s: marked %d job(s) failed after %d attempts", w.id, n, MaxAttempts)
+	}
+
+	// Containers whose worker died before it could remove them. Once a
+	// minute is plenty.
+	if time.Since(w.lastOrphanSweep) < time.Minute {
+		return
+	}
+	w.lastOrphanSweep = time.Now()
+	if n, err := sandbox.RemoveOrphans(2 * time.Minute); err != nil {
+		log.Printf("worker %s: removing orphaned containers: %v", w.id, err)
+	} else if n > 0 {
+		log.Printf("worker %s: removed %d orphaned container(s)", w.id, n)
+	}
+}
+
 func (w *Worker) process(ctx context.Context, job *store.Job) {
-	log.Printf("worker %s: judging %s (%s)", w.id, job.ID, job.Language)
+	log.Printf("worker %s: judging %s (%s, attempt %d of %d)", w.id, job.ID, job.Language, job.Attempt, MaxAttempts)
 	if err := w.store.RecordClaim(ctx, job.ID, w.id); err != nil {
 		log.Printf("worker %s: recording claim of %s failed: %v", w.id, job.ID, err)
 	}
 
-	// If anything below fails, the submission stays 'running' forever,
-	// because nothing ever looks at it again. Step 5 (leases) fixes that.
-	problem, tests, err := w.store.LoadProblem(ctx, job.ProblemID)
-	if err != nil {
-		log.Printf("worker %s: loading problem for %s failed: %v", w.id, job.ID, err)
-		return
-	}
-	if len(tests) == 0 {
-		log.Printf("worker %s: problem %s has no test cases", w.id, job.ProblemID)
-		return
-	}
+	// jobCtx is the context for judging this one job. The heartbeat cancels
+	// it if it finds we've lost the lease, which stops the judging (the
+	// sandbox kills the container) instead of wasting time on a job that
+	// isn't ours any more.
+	jobCtx, cancelJob := context.WithCancel(ctx)
+	defer cancelJob()
 
-	// Step 1 judges only the first test case. Step 6 runs all of them.
-	tc := tests[0]
-	limits := judge.Limits{
-		Time:     time.Duration(problem.TimeLimitMs) * time.Millisecond,
-		MemoryMB: problem.MemoryLimitMb,
-	}
+	// The heartbeat runs alongside the judging, in its own goroutine.
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		w.heartbeat(jobCtx, job.ID, cancelJob)
+	}()
 
-	res, err := judge.Judge(ctx, job.Language, job.SourceCode, tc.Input, tc.ExpectedOutput, limits)
+	res, err := w.judgeJob(jobCtx, job)
+
+	// Judging is over: stop the heartbeat, and wait until it has stopped.
+	cancelJob()
+	<-heartbeatDone
+
 	if err != nil {
-		log.Printf("worker %s: judging %s failed: %v", w.id, job.ID, err)
+		// Our side failed (Docker trouble, lost lease, shutting down), not
+		// the submission. Save nothing. We've stopped renewing the lease,
+		// so in at most one lease the job can be claimed again, by any
+		// worker, the same as if this worker had crashed.
+		log.Printf("worker %s: judging %s failed, leaving it to be retried: %v", w.id, job.ID, err)
 		return
 	}
 	if res.Verdict == judge.RuntimeError || res.Verdict == judge.CompileError {
 		log.Printf("worker %s: %s %s output:\n%s", w.id, job.ID, res.Verdict, res.Stderr)
 	}
 
-	if err := w.store.FinishSubmission(ctx, job.ID, string(res.Verdict), res.RuntimeMs); err != nil {
+	err = w.store.FinishSubmission(ctx, job.ID, w.id, string(res.Verdict), res.RuntimeMs)
+	if errors.Is(err, store.ErrLeaseLost) {
+		log.Printf("worker %s: %s is no longer ours (our lease ran out and another worker took it); throwing our result away", w.id, job.ID)
+		return
+	}
+	if err != nil {
 		log.Printf("worker %s: saving verdict for %s failed: %v", w.id, job.ID, err)
 		return
 	}
 	log.Printf("worker %s: %s -> %s (%d ms)", w.id, job.ID, res.Verdict, res.RuntimeMs)
+}
+
+// heartbeat renews the job's lease every heartbeatEvery until ctx is
+// cancelled. If a renewal finds the job is no longer ours, it calls lost()
+// to stop the judging.
+func (w *Worker) heartbeat(ctx context.Context, jobID string, lost func()) {
+	ticker := time.NewTicker(w.heartbeatEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		ours, err := w.store.ExtendLease(ctx, jobID, w.id, w.lease)
+		switch {
+		case ctx.Err() != nil:
+			return // judging finished while we were renewing
+		case err != nil:
+			// Probably a database blip. Keep going: the lease has room for
+			// a couple of missed heartbeats.
+			log.Printf("worker %s: heartbeat for %s failed: %v", w.id, jobID, err)
+		case !ours:
+			log.Printf("worker %s: lost the lease on %s; stopping", w.id, jobID)
+			lost()
+			return
+		}
+	}
+}
+
+// judgeJob loads the job's problem and judges it.
+func (w *Worker) judgeJob(ctx context.Context, job *store.Job) (judge.Result, error) {
+	problem, tests, err := w.store.LoadProblem(ctx, job.ProblemID)
+	if err != nil {
+		return judge.Result{}, fmt.Errorf("loading problem: %w", err)
+	}
+	if len(tests) == 0 {
+		return judge.Result{}, fmt.Errorf("problem %s has no test cases", job.ProblemID)
+	}
+
+	// Only the first test case for now. Step 6 runs all of them.
+	tc := tests[0]
+	limits := judge.Limits{
+		Time:     time.Duration(problem.TimeLimitMs) * time.Millisecond,
+		MemoryMB: problem.MemoryLimitMb,
+	}
+	return judge.Judge(ctx, job.Language, job.SourceCode, tc.Input, tc.ExpectedOutput, limits)
 }
 
 // sleep waits for d, or returns early if ctx is cancelled.

@@ -16,6 +16,10 @@ import (
 // ErrNotFound means an id didn't match any row.
 var ErrNotFound = errors.New("not found")
 
+// ErrLeaseLost means a job isn't ours any more: our lease ran out and
+// another worker claimed it.
+var ErrLeaseLost = errors.New("lease lost: another worker owns this job now")
+
 type Store struct {
 	pool *pgxpool.Pool
 
@@ -57,6 +61,7 @@ type Job struct {
 	ProblemID  string
 	Language   string
 	SourceCode string
+	Attempt    int // 1 the first time a job is claimed, 2 if it's being retried, ...
 }
 
 // CreateProblem inserts a problem and its test cases in one transaction, so a
@@ -130,12 +135,20 @@ func (s *Store) GetSubmission(ctx context.Context, id string) (Submission, error
 	return sub, err
 }
 
-// ClaimNextPending takes the oldest pending submission and marks it as
-// running under workerID. It returns nil when there's nothing to claim.
-// It's safe with any number of workers calling it at the same moment.
-func (s *Store) ClaimNextPending(ctx context.Context, workerID string) (*Job, error) {
+// ClaimNextPending claims the oldest job that needs a worker and marks it as
+// running under workerID, with a lease that runs out after `lease` unless
+// the worker keeps renewing it (ExtendLease). It returns nil when there's
+// nothing to claim. It's safe with any number of workers calling it at once.
+//
+// "Needs a worker" means either:
+//   - pending: nobody has claimed it yet, or
+//   - running, but its lease has run out: whoever claimed it stopped
+//     renewing the lease, so they're presumably dead.
+//
+// Either way, only if it has been claimed fewer than maxAttempts times.
+func (s *Store) ClaimNextPending(ctx context.Context, workerID string, lease time.Duration, maxAttempts int) (*Job, error) {
 	if s.UnsafeClaim {
-		return s.claimNextPendingUnsafe(ctx, workerID)
+		return s.claimNextPendingUnsafe(ctx, workerID, lease)
 	}
 
 	// Everything below happens inside one transaction, on one connection.
@@ -154,16 +167,21 @@ func (s *Store) ClaimNextPending(ctx context.Context, workerID string) (*Job, er
 	// for it; pass over it and take the next free one.
 	// Note tx.QueryRow, not s.pool.QueryRow: the pool would run this on a
 	// different connection, outside our transaction.
+	// now() is the database's clock, so lease times never depend on whose
+	// computer's clock is right.
 	err = tx.QueryRow(ctx,
 		`SELECT id, problem_id, language, source_code
 		 FROM submissions
-		 WHERE status = 'pending'
+		 WHERE (status = 'pending'
+		        OR (status = 'running' AND lease_expires_at < now()))
+		   AND retry_count < $1
 		 ORDER BY created_at
 		 LIMIT 1
 		 FOR UPDATE SKIP LOCKED`,
+		maxAttempts,
 	).Scan(&j.ID, &j.ProblemID, &j.Language, &j.SourceCode)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil // every pending row is taken or locked by someone else
+		return nil, nil // every claimable row is taken or locked by someone else
 	}
 	if err != nil {
 		return nil, err
@@ -174,15 +192,20 @@ func (s *Store) ClaimNextPending(ctx context.Context, workerID string) (*Job, er
 	time.Sleep(s.ClaimDelay)
 
 	// Still inside the transaction, so still holding the lock: mark the job
-	// taken. When COMMIT releases the lock a moment later, the row already
-	// says 'running', so no worker's "WHERE status = 'pending'" can match it
-	// again. The lock covers the gap; the UPDATE makes the claim permanent.
-	_, err = tx.Exec(ctx,
+	// taken, start our lease, and count the attempt. When COMMIT releases
+	// the lock a moment later, the row already says 'running' with a fresh
+	// lease, so no other worker's WHERE clause can match it.
+	err = tx.QueryRow(ctx,
 		`UPDATE submissions
-		 SET status = 'running', worker_id = $2, updated_at = now()
-		 WHERE id = $1`,
-		j.ID, workerID,
-	)
+		 SET status = 'running',
+		     worker_id = $2,
+		     lease_expires_at = now() + make_interval(secs => $3),
+		     retry_count = retry_count + 1,
+		     updated_at = now()
+		 WHERE id = $1
+		 RETURNING retry_count`,
+		j.ID, workerID, lease.Seconds(),
+	).Scan(&j.Attempt)
 	if err != nil {
 		return nil, err
 	}
@@ -199,7 +222,7 @@ func (s *Store) ClaimNextPending(ctx context.Context, workerID string) (*Job, er
 // connection the pool hands out, with nothing locking the row in between.
 // So two workers can both find the same pending job before either marks it
 // running, and both judge it.
-func (s *Store) claimNextPendingUnsafe(ctx context.Context, workerID string) (*Job, error) {
+func (s *Store) claimNextPendingUnsafe(ctx context.Context, workerID string, lease time.Duration) (*Job, error) {
 	var j Job
 	err := s.pool.QueryRow(ctx,
 		`SELECT id, problem_id, language, source_code
@@ -219,16 +242,57 @@ func (s *Store) claimNextPendingUnsafe(ctx context.Context, workerID string) (*J
 	// (Zero, so no pause, unless CLAIM_DELAY_MS is set.)
 	time.Sleep(s.ClaimDelay)
 
-	_, err = s.pool.Exec(ctx,
+	err = s.pool.QueryRow(ctx,
 		`UPDATE submissions
-		 SET status = 'running', worker_id = $2, updated_at = now()
-		 WHERE id = $1`,
-		j.ID, workerID,
-	)
+		 SET status = 'running',
+		     worker_id = $2,
+		     lease_expires_at = now() + make_interval(secs => $3),
+		     retry_count = retry_count + 1,
+		     updated_at = now()
+		 WHERE id = $1
+		 RETURNING retry_count`,
+		j.ID, workerID, lease.Seconds(),
+	).Scan(&j.Attempt)
 	if err != nil {
 		return nil, err
 	}
 	return &j, nil
+}
+
+// ExtendLease pushes a job's lease forward to now + lease: the heartbeat.
+// It only does so if the job is still ours (still running under our worker
+// id), and reports whether it was. false means our lease ran out at some
+// point and another worker has claimed the job since.
+func (s *Store) ExtendLease(ctx context.Context, id, workerID string, lease time.Duration) (bool, error) {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE submissions
+		 SET lease_expires_at = now() + make_interval(secs => $3), updated_at = now()
+		 WHERE id = $1 AND worker_id = $2 AND status = 'running'`,
+		id, workerID, lease.Seconds(),
+	)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// FailExhausted gives up on jobs that will never finish: their lease ran
+// out on their last allowed attempt (they've been claimed maxAttempts times
+// and the last worker vanished too). They're marked 'failed' instead of
+// being retried forever. Returns how many it marked.
+func (s *Store) FailExhausted(ctx context.Context, maxAttempts int) (int64, error) {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE submissions
+		 SET status = 'failed', lease_expires_at = NULL, updated_at = now()
+		 WHERE status = 'running'
+		   AND lease_expires_at < now()
+		   AND retry_count >= $1`,
+		maxAttempts,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 // RecordClaim logs that workerID claimed a submission, in the claims table.
@@ -274,15 +338,25 @@ func (s *Store) LoadProblem(ctx context.Context, problemID string) (Problem, []T
 	return p, tests, nil
 }
 
-// FinishSubmission records the verdict and marks the submission done.
-func (s *Store) FinishSubmission(ctx context.Context, id, verdict string, runtimeMs int) error {
-	_, err := s.pool.Exec(ctx,
+// FinishSubmission records the verdict and marks the submission done, but
+// only if the job is still ours. If it isn't (our lease ran out and another
+// worker claimed it), it saves nothing and returns ErrLeaseLost: the other
+// worker's result is the one that counts.
+func (s *Store) FinishSubmission(ctx context.Context, id, workerID, verdict string, runtimeMs int) error {
+	tag, err := s.pool.Exec(ctx,
 		`UPDATE submissions
-		 SET status = 'done', verdict = $2, runtime_ms = $3, updated_at = now()
-		 WHERE id = $1`,
-		id, verdict, runtimeMs,
+		 SET status = 'done', verdict = $3, runtime_ms = $4,
+		     lease_expires_at = NULL, updated_at = now()
+		 WHERE id = $1 AND worker_id = $2 AND status = 'running'`,
+		id, workerID, verdict, runtimeMs,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrLeaseLost
+	}
+	return nil
 }
 
 // isBadReference reports whether err means an id didn't point at a real row:

@@ -87,6 +87,7 @@ func Run(ctx context.Context, spec Spec) (Result, error) {
 	args := []string{
 		"run",
 		"--name", name, // so we can kill, inspect and remove this exact container
+		"--label", containerLabel, // so leftovers from a crashed worker can be found (RemoveOrphans)
 		"-i", // keep stdin open so the test input reaches the program
 
 		// Resource limits, enforced by the kernel through cgroups.
@@ -266,6 +267,42 @@ func removeContainer(name string, patience time.Duration) error {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
+}
+
+// containerLabel marks every container the sandbox starts.
+const containerLabel = "codejudge.sandbox"
+
+// RemoveOrphans removes sandbox containers older than maxAge, running or
+// not, and returns how many it removed.
+//
+// A healthy run never lives that long: compiling plus running takes well
+// under a minute. An old container belonged to a worker that crashed before
+// it could clean up. Remember that killing a worker doesn't stop its
+// container, so without this a crashed worker's infinite loop would keep
+// burning a CPU forever.
+func RemoveOrphans(maxAge time.Duration) (int, error) {
+	out, err := exec.Command("docker", "ps", "-a",
+		"--filter", "label="+containerLabel,
+		"--format", "{{.Names}}\t{{.CreatedAt}}").Output()
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		name, created, ok := strings.Cut(line, "\t")
+		if !ok {
+			continue
+		}
+		// docker prints times like "2026-11-13 20:33:10 +0000 UTC".
+		createdAt, err := time.Parse("2006-01-02 15:04:05 -0700 MST", created)
+		if err != nil || time.Since(createdAt) < maxAge {
+			continue
+		}
+		if removeContainer(name, 30*time.Second) == nil {
+			removed++
+		}
+	}
+	return removed, nil
 }
 
 func containerName() (string, error) {

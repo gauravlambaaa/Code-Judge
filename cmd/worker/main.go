@@ -63,7 +63,18 @@ func main() {
 		log.Print("worker: using the UNSAFE Step 1 claim query (race demo)")
 	}
 
-	worker.New(st, worker.DefaultID()).Run(ctx)
+	// How long a claim lasts without a heartbeat. 30 s normally; the Step 5
+	// crash demo uses less so you don't have to wait as long.
+	lease := 30 * time.Second
+	if v := os.Getenv("LEASE_SECONDS"); v != "" {
+		secs, err := strconv.Atoi(v)
+		if err != nil || secs < 3 {
+			log.Fatalf("LEASE_SECONDS must be a whole number of at least 3, got %q", v)
+		}
+		lease = time.Duration(secs) * time.Second
+	}
+
+	worker.New(st, worker.DefaultID(), lease).Run(ctx)
 
 	// Containers that were slow to die are removed in the background; wait
 	// for those so none are left behind.
