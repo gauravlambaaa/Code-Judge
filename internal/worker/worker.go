@@ -79,8 +79,8 @@ func (w *Worker) process(ctx context.Context, job *store.Job) {
 		log.Printf("worker %s: judging %s failed: %v", w.id, job.ID, err)
 		return
 	}
-	if res.Verdict == judge.RuntimeError {
-		log.Printf("worker %s: %s stderr:\n%s", w.id, job.ID, res.Stderr)
+	if res.Verdict == judge.RuntimeError || res.Verdict == judge.CompileError {
+		log.Printf("worker %s: %s %s output:\n%s", w.id, job.ID, res.Verdict, res.Stderr)
 	}
 
 	if err := w.store.FinishSubmission(ctx, job.ID, string(res.Verdict), res.RuntimeMs); err != nil {

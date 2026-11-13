@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os/exec"
 	"strings"
 	"sync"
@@ -49,7 +50,8 @@ func WaitForCleanup() {
 type Spec struct {
 	Image     string        // Docker image, e.g. "python:3.13-slim"
 	Cmd       []string      // command to run inside the container
-	Dir       string        // host directory, mounted read-only at /sandbox
+	Dir       string        // host directory, mounted at /sandbox
+	Writable  bool          // mount Dir read-write (compilers need to write their output); otherwise read-only
 	Stdin     string        // fed to the program on stdin
 	TimeLimit time.Duration // how long the program may run
 	MemoryMB  int           // memory limit; going over gets the program killed
@@ -77,6 +79,11 @@ func Run(ctx context.Context, spec Spec) (Result, error) {
 		return Result{}, err
 	}
 
+	mount := spec.Dir + ":/sandbox:ro" // the code, read-only...
+	if spec.Writable {
+		mount = spec.Dir + ":/sandbox:rw" // ...unless a compiler needs to write next to it
+	}
+
 	args := []string{
 		"run",
 		"--name", name, // so we can kill, inspect and remove this exact container
@@ -100,7 +107,7 @@ func Run(ctx context.Context, spec Spec) (Result, error) {
 		// it directly, so turn that off; otherwise a print loop fills the disk.
 		"--log-driver=none",
 
-		"-v", spec.Dir + ":/sandbox:ro", // the code, read-only
+		"-v", mount,
 		"-w", "/sandbox",
 		spec.Image,
 	}
@@ -108,15 +115,18 @@ func Run(ctx context.Context, spec Spec) (Result, error) {
 
 	// However we leave this function, the container gets removed. Normally
 	// that takes a few milliseconds and happens right here. If the container
-	// refused to die in time (see killWait), the removal happens in the
-	// background instead, so the worker can move on to the next job.
+	// refused to die in time (see killWait), or Docker is too busy to answer
+	// (it slows right down while a fork bomb is dying), we keep retrying in
+	// the background so the worker can move on to the next job.
 	removeInBackground := false
 	defer func() {
-		if removeInBackground {
+		if removeInBackground || removeContainer(name, 10*time.Second) != nil {
 			// WaitGroup.Go starts the goroutine and counts it until it returns.
-			backgroundRemovals.Go(func() { removeContainer(name, 2*time.Minute) })
-		} else {
-			removeContainer(name, 30*time.Second)
+			backgroundRemovals.Go(func() {
+				if err := removeContainer(name, 5*time.Minute); err != nil {
+					log.Printf("sandbox: could not remove container %s (%v); remove it with: docker rm -f %s", name, err, name)
+				}
+			})
 		}
 	}()
 
@@ -238,11 +248,24 @@ func killContainer(name string) {
 	exec.CommandContext(ctx, "docker", "kill", name).Run()
 }
 
-// removeContainer force-removes the container (killing it first if needed).
-func removeContainer(name string, timeout time.Duration) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	exec.CommandContext(ctx, "docker", "rm", "-f", name).Run()
+// removeContainer force-removes the container (killing it first if needed),
+// retrying until it's gone or patience runs out. One attempt isn't enough:
+// Docker can take a long time to answer while another container is
+// thrashing. It returns nil once the container is gone, or the last error.
+func removeContainer(name string, patience time.Duration) error {
+	deadline := time.Now().Add(patience)
+	for {
+		ctx, cancel := context.WithDeadline(context.Background(), deadline)
+		out, err := exec.CommandContext(ctx, "docker", "rm", "-f", name).CombinedOutput()
+		cancel()
+		if err == nil || strings.Contains(string(out), "No such container") {
+			return nil
+		}
+		if time.Until(deadline) <= 0 {
+			return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 func containerName() (string, error) {
