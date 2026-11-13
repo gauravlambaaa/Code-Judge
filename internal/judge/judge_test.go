@@ -44,6 +44,7 @@ func TestVerdicts(t *testing.T) {
 
 		{"ac.cpp", Accepted},
 		{"ce.cpp", CompileError},
+		{"ce_bomb.cpp", CompileError},
 		{"re.cpp", RuntimeError},
 		{"tle.cpp", TimeLimitExceeded},
 		{"mle.cpp", MemoryLimitExceeded},
