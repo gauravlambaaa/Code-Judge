@@ -1,21 +1,23 @@
 #!/usr/bin/env bash
-# One-command demo: starts the API, submits programs from testdata/sum,
-# waits for the verdicts, prints them, then stops the API.
+# One-command demo: starts the API and a worker, submits programs from
+# testdata/sum, waits for the verdicts, prints them, then stops everything.
 #
 # Run it in Ubuntu (not Windows PowerShell), from the project folder:
 #   bash scripts/demo.sh                    # every program in testdata/sum
 #   bash scripts/demo.sh ac.cpp mle.java    # just these files
 #   bash scripts/demo.sh fork net           # no extension means .py
+#   WORKERS=3 bash scripts/demo.sh          # judge with 3 workers at once
 #
 # The language comes from the extension: .py, .cpp or .java.
-# The worker's log (including compiler errors and stderr of crashing
-# programs) ends up in /tmp/judge-api.log.
+# Worker logs (including compiler errors and stderr of crashing programs)
+# end up in /tmp/judge-worker-1.log, -2.log, ...
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 if [ -z "${DATABASE_URL:-}" ]; then
   set -a; source .env.example; set +a
 fi
+WORKERS=${WORKERS:-1}
 PORT=${PORT:-8080}
 API=http://localhost:$PORT
 
@@ -36,13 +38,24 @@ else
   done
 fi
 
-echo "Building and starting the API on port $PORT..."
+echo "Building and starting the API and $WORKERS worker(s)..."
 go build -o /tmp/judge-api ./cmd/api
+go build -o /tmp/judge-worker ./cmd/worker
+
+PIDS=()
+stop_all() {
+  # Stop everything the same way Ctrl+C would, then wait for it to finish.
+  for pid in "${PIDS[@]}"; do kill -INT "$pid" 2>/dev/null || true; done
+  for pid in "${PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+}
+trap stop_all EXIT
+
 ADDR=":$PORT" /tmp/judge-api > /tmp/judge-api.log 2>&1 &
-SERVER=$!
-# When this script exits (normally, on error, or on Ctrl+C), stop the API
-# the same way Ctrl+C would.
-trap 'kill -INT "$SERVER" 2>/dev/null || true; wait "$SERVER" 2>/dev/null || true' EXIT
+PIDS+=($!)
+for i in $(seq 1 "$WORKERS"); do
+  /tmp/judge-worker > "/tmp/judge-worker-$i.log" 2>&1 &
+  PIDS+=($!)
+done
 for _ in $(seq 1 50); do curl -s -o /dev/null "$API/submissions/x" && break; sleep 0.1; done
 
 PROBLEM=$(curl -sS -X POST "$API/problems" -H 'Content-Type: application/json' \
@@ -60,7 +73,7 @@ for file in "${FILES[@]}"; do
   IDS+=("$(JUDGE_URL=$API bash scripts/submit.sh "$PROBLEM" "$language" "testdata/sum/$file" |
     python3 -c 'import json,sys; print(json.load(sys.stdin)["submission_id"])')")
 done
-echo "Submitted ${#FILES[@]} programs. Waiting for verdicts (one worker, so one at a time)..."
+echo "Submitted ${#FILES[@]} programs. Waiting for verdicts..."
 
 printf '\n%-12s %-8s %s\n' PROGRAM VERDICT RUNTIME
 for i in "${!FILES[@]}"; do
@@ -78,4 +91,4 @@ for i in "${!FILES[@]}"; do
   fi
 done
 echo
-echo "Worker log: /tmp/judge-api.log"
+echo "Worker logs: /tmp/judge-worker-*.log"

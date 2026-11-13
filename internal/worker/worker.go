@@ -54,6 +54,9 @@ func (w *Worker) Run(ctx context.Context) {
 
 func (w *Worker) process(ctx context.Context, job *store.Job) {
 	log.Printf("worker %s: judging %s (%s)", w.id, job.ID, job.Language)
+	if err := w.store.RecordClaim(ctx, job.ID, w.id); err != nil {
+		log.Printf("worker %s: recording claim of %s failed: %v", w.id, job.ID, err)
+	}
 
 	// If anything below fails, the submission stays 'running' forever,
 	// because nothing ever looks at it again. Step 5 (leases) fixes that.

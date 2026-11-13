@@ -1,8 +1,9 @@
-// Command api serves the HTTP API.
+// Command api serves the HTTP API: create problems, accept submissions,
+// report results.
 //
-// In Steps 1-3 it also runs the worker, in a background goroutine. Step 4
-// moves the worker into its own program (cmd/worker) so several can run at
-// once.
+// It doesn't judge anything. Since Step 4, judging happens in separate
+// worker processes (cmd/worker), so you can run as many as you need without
+// touching the API.
 package main
 
 import (
@@ -18,9 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"codejudge/internal/api"
-	"codejudge/internal/sandbox"
 	"codejudge/internal/store"
-	"codejudge/internal/worker"
 )
 
 func main() {
@@ -34,13 +33,12 @@ func main() {
 	}
 
 	// ctx is cancelled when you press Ctrl+C (SIGINT) or the process gets
-	// SIGTERM. Everything below watches it, so the program can stop cleanly.
+	// SIGTERM, which starts a clean shutdown.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	// A pool keeps several database connections open and hands one to each
-	// query, so the HTTP handlers and the worker don't queue up behind a
-	// single connection.
+	// query, so concurrent requests don't queue up behind one connection.
 	pool, err := pgxpool.New(ctx, dbURL)
 	if err != nil {
 		log.Fatalf("connect to database: %v", err)
@@ -50,31 +48,21 @@ func main() {
 		log.Fatalf("connect to database: %v", err)
 	}
 
-	st := store.New(pool)
-
-	w := worker.New(st, worker.DefaultID())
-	workerDone := make(chan struct{})
-	go func() {
-		w.Run(ctx)
-		close(workerDone)
-	}()
-
-	srv := &http.Server{Addr: addr, Handler: api.New(st).Routes()}
+	srv := &http.Server{Addr: addr, Handler: api.New(store.New(pool)).Routes()}
+	shutdownDone := make(chan struct{})
 	go func() {
 		<-ctx.Done()
 		// Stop accepting new requests and give in-flight ones 5 s to finish.
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		srv.Shutdown(shutdownCtx)
+		close(shutdownDone)
 	}()
 
 	log.Printf("api: listening on %s", addr)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("api: %v", err)
 	}
-	<-workerDone
-	// Containers that were slow to die are removed in the background;
-	// wait for those so none are left behind.
-	sandbox.WaitForCleanup()
+	<-shutdownDone
 	log.Print("api: stopped")
 }

@@ -6,6 +6,7 @@ package store
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -17,6 +18,11 @@ var ErrNotFound = errors.New("not found")
 
 type Store struct {
 	pool *pgxpool.Pool
+
+	// ClaimDelay pauses ClaimNextPending between finding a job and marking
+	// it running. It's zero normally; the Step 4 race demo sets it (via
+	// CLAIM_DELAY_MS) to make the race window wide enough to see.
+	ClaimDelay time.Duration
 }
 
 func New(pool *pgxpool.Pool) *Store {
@@ -125,7 +131,8 @@ func (s *Store) GetSubmission(ctx context.Context, id string) (Submission, error
 //
 // STEP 1 VERSION: this is only correct while there is a single worker.
 // The SELECT and the UPDATE are two separate statements with nothing locking
-// the row in between. Step 4 replaces this function.
+// the row in between, so two workers can both find the same pending job
+// before either marks it running. Step 4: you rewrite this function.
 func (s *Store) ClaimNextPending(ctx context.Context, workerID string) (*Job, error) {
 	var j Job
 	err := s.pool.QueryRow(ctx,
@@ -142,6 +149,10 @@ func (s *Store) ClaimNextPending(ctx context.Context, workerID string) (*Job, er
 		return nil, err
 	}
 
+	// Race demo: widen the gap between "found it" and "marked it taken".
+	// (Zero, so no pause, unless CLAIM_DELAY_MS is set.)
+	time.Sleep(s.ClaimDelay)
+
 	_, err = s.pool.Exec(ctx,
 		`UPDATE submissions
 		 SET status = 'running', worker_id = $2, updated_at = now()
@@ -152,6 +163,17 @@ func (s *Store) ClaimNextPending(ctx context.Context, workerID string) (*Job, er
 		return nil, err
 	}
 	return &j, nil
+}
+
+// RecordClaim logs that workerID claimed a submission, in the claims table.
+// Judging doesn't need it: it's evidence. If two workers ever claim the
+// same submission, it shows up there as two rows.
+func (s *Store) RecordClaim(ctx context.Context, submissionID, workerID string) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO claims (submission_id, worker_id) VALUES ($1, $2)`,
+		submissionID, workerID,
+	)
+	return err
 }
 
 // LoadProblem returns a problem's limits and its test cases, in order.
