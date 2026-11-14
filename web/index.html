@@ -435,16 +435,45 @@ function renderProblem() {
 }
 
 // ---------- Loading problems ----------
+let pageReady = false;
+
+// servedByApp is false when this page was opened as a file or a preview
+// snapshot instead of from the running server, so there's no API to call.
+const servedByApp = location.protocol === "http:" || location.protocol === "https:";
+
+// apiProblem explains why the page can't reach the API, or returns "" if it can.
+function apiProblem(error) {
+  if (!servedByApp) {
+    return "This is a preview of the page's file, not the running app, so there's no server to talk to. " +
+           "Start the app with scripts/web.sh and open http://localhost:8080 instead.";
+  }
+  return error ? `Couldn't reach the API (${error.message}). Is scripts/web.sh still running? Trying again…` : "";
+}
+
 async function loadProblems() {
+  let error = null;
   try {
     const r = await fetch("/problems");
+    if (!r.ok) throw new Error("it answered " + r.status);
     problems = await r.json();
   } catch (e) {
-    $("problem-body").innerHTML = `<p class="error">Couldn't reach the API: ${esc(e.message)}</p>`;
-    return;
+    error = e;
   }
+  const keep = $("problem").value;
   $("problem").innerHTML = problems.map((p) => `<option value="${p.id}">${esc(p.title)}</option>`).join("");
-  setMode(mode);
+  if (problems.some((p) => p.id === keep)) $("problem").value = keep;
+
+  if (!pageReady) { pageReady = true; setMode(mode); }          // first load: set the page up
+  else if (mode === "problems") { renderProblem(); fillExamples(); showDraft(); }
+
+  const problemText = apiProblem(error);
+  if (problemText) {
+    $("problem-body").innerHTML = `<p class="error">${esc(problemText)}</p>`;
+    $("error").textContent = problemText;
+    if (servedByApp) setTimeout(loadProblems, 3000); // the server may be restarting
+  } else {
+    $("error").textContent = "";
+  }
 }
 
 // ---------- Submitting and polling ----------
@@ -562,7 +591,11 @@ $("example").addEventListener("change", (e) => {
   e.target.value = "";
 });
 $("tab-playground").addEventListener("click", () => { if (!busy) setMode("playground"); });
-$("tab-problems").addEventListener("click", () => { if (!busy) setMode("problems"); });
+$("tab-problems").addEventListener("click", () => {
+  if (busy) return;
+  setMode("problems");
+  if (problems.length === 0) loadProblems(); // nothing loaded yet: ask the server again
+});
 $("submit").addEventListener("click", () => send("judge"));
 $("run").addEventListener("click", () => send("run"));
 $("code").addEventListener("keydown", (e) => {
