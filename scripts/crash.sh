@@ -39,7 +39,7 @@ for _ in $(seq 1 50); do curl -s -o /dev/null "$API/submissions/x" && break; sle
 
 # A problem with a 10 s time limit, so slow.py (which takes 5 s) is a correct answer.
 PROBLEM=$(curl -sS -X POST "$API/problems" -H 'Content-Type: application/json' \
-  -d '{"title": "Sum (slow is fine)", "time_limit_ms": 10000, "test_cases": [{"input": "2 3\n", "expected_output": "5\n"}]}' |
+  -d '{"title": "Sum (slow is fine)", "statement": "Used by scripts/crash.sh: print a + b, with a 10 s time limit so slow.py counts as correct.", "time_limit_ms": 10000, "test_cases": [{"input": "2 3\n", "expected_output": "5\n"}]}' |
   python3 -c 'import json,sys; print(json.load(sys.stdin)["problem_id"])')
 ID=$(JUDGE_URL=$API bash scripts/submit.sh "$PROBLEM" python testdata/sum/slow.py |
   python3 -c 'import json,sys; print(json.load(sys.stdin)["submission_id"])')

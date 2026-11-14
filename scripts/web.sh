@@ -42,13 +42,22 @@ for i in $(seq 1 "$WORKERS"); do
 done
 for _ in $(seq 1 50); do curl -s -o /dev/null "$API/problems" && break; sleep 0.1; done
 
-existing=$(curl -s "$API/problems" | python3 -c 'import json,sys; print("\n".join(p["title"] for p in json.load(sys.stdin)))')
+# Add each sample problem unless the newest copy in the database already
+# matches the file (same statement and number of tests). The page only lists
+# the newest copy of each title, so an outdated copy is simply hidden.
+curl -s "$API/problems" > /tmp/judge-problems.json
 for f in testdata/*/problem.json; do
-  title=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["title"])' "$f")
-  if ! grep -qxF "$title" <<< "$existing"; then
-    curl -sS -X POST "$API/problems" -H 'Content-Type: application/json' --data-binary @"$f" > /dev/null
-    echo "Added sample problem: $title"
-  fi
+  if python3 - "$f" /tmp/judge-problems.json <<'EOF'
+import json, sys
+want = json.load(open(sys.argv[1]))
+have = {p["title"]: p for p in json.load(open(sys.argv[2]))}
+p = have.get(want["title"])
+up_to_date = p and p["statement"] == want.get("statement", "") and p["test_count"] == len(want["test_cases"])
+sys.exit(0 if up_to_date else 1)
+EOF
+  then continue; fi
+  curl -sS -X POST "$API/problems" -H 'Content-Type: application/json' --data-binary @"$f" > /dev/null
+  echo "Added sample problem: $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["title"])' "$f")"
 done
 
 echo
