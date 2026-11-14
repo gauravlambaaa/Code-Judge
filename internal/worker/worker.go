@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"codejudge/internal/judge"
@@ -140,7 +141,7 @@ func (w *Worker) process(ctx context.Context, job *store.Job) {
 	for i, t := range res.Tests {
 		tests[i] = store.TestResult{Number: t.Number, Verdict: string(t.Verdict), RuntimeMs: t.RuntimeMs}
 	}
-	err = w.store.FinishSubmission(ctx, job.ID, w.id, string(res.Verdict), res.RuntimeMs, tests)
+	err = w.store.FinishSubmission(ctx, job.ID, w.id, string(res.Verdict), res.RuntimeMs, shortMessage(res.Stderr), tests)
 	if errors.Is(err, store.ErrLeaseLost) {
 		log.Printf("worker %s: %s is no longer ours (our lease ran out and another worker took it); throwing our result away", w.id, job.ID)
 		return
@@ -204,6 +205,19 @@ func (w *Worker) judgeJob(ctx context.Context, job *store.Job) (judge.Result, er
 		MemoryMB: problem.MemoryLimitMb,
 	}
 	return judge.Judge(ctx, job.Language, job.SourceCode, tests, limits)
+}
+
+// shortMessage turns the compiler's or program's output into something safe
+// to store and show: at most about 4 KB, and only valid UTF-8 with no NUL
+// bytes. A program can print any bytes it likes, and Postgres text columns
+// reject both of those, which would make saving the verdict fail.
+func shortMessage(s string) string {
+	const limit = 4096
+	if len(s) > limit {
+		s = s[:limit] + "\n... (cut)"
+	}
+	s = strings.ToValidUTF8(s, "?")
+	return strings.ReplaceAll(s, "\x00", "")
 }
 
 // sleep waits for d, or returns early if ctx is cancelled.

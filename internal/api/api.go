@@ -11,6 +11,7 @@ import (
 
 	"codejudge/internal/judge"
 	"codejudge/internal/store"
+	"codejudge/web"
 )
 
 type Server struct {
@@ -25,15 +26,52 @@ func New(st *store.Store) *Server {
 // since Go 1.22, so no router library is needed.
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", s.index) // {$} means exactly "/", not every path
+	mux.HandleFunc("GET /problems", s.listProblems)
 	mux.HandleFunc("POST /problems", s.createProblem)
 	mux.HandleFunc("POST /submissions", s.createSubmission)
 	mux.HandleFunc("GET /submissions/{id}", s.getSubmission)
 	return mux
 }
 
+// index serves the web page. It's compiled into the binary (see web/web.go),
+// so there are no separate files to deploy.
+func (s *Server) index(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(web.Index)
+}
+
+func (s *Server) listProblems(w http.ResponseWriter, r *http.Request) {
+	problems, err := s.store.ListProblems(r.Context())
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	type example struct {
+		Input          string `json:"input"`
+		ExpectedOutput string `json:"expected_output"`
+	}
+	type problem struct {
+		ID            string  `json:"id"`
+		Title         string  `json:"title"`
+		Statement     string  `json:"statement"`
+		TimeLimitMs   int     `json:"time_limit_ms"`
+		MemoryLimitMb int     `json:"memory_limit_mb"`
+		TestCount     int     `json:"test_count"`
+		Example       example `json:"example"` // only test 1: the rest stay hidden, like a real judge
+	}
+	out := make([]problem, len(problems))
+	for i, p := range problems {
+		out[i] = problem{p.ID, p.Title, p.Statement, p.TimeLimitMs, p.MemoryLimitMb, p.TestCount,
+			example{p.ExampleInput, p.ExampleOutput}}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 func (s *Server) createProblem(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Title         string `json:"title"`
+		Statement     string `json:"statement"`
 		TimeLimitMs   int    `json:"time_limit_ms"`
 		MemoryLimitMb int    `json:"memory_limit_mb"`
 		TestCases     []struct {
@@ -60,7 +98,7 @@ func (s *Server) createProblem(w http.ResponseWriter, r *http.Request) {
 		tests[i] = store.TestCase{Input: tc.Input, ExpectedOutput: tc.ExpectedOutput}
 	}
 
-	id, err := s.store.CreateProblem(r.Context(), req.Title, req.TimeLimitMs, req.MemoryLimitMb, tests)
+	id, err := s.store.CreateProblem(r.Context(), req.Title, req.Statement, req.TimeLimitMs, req.MemoryLimitMb, tests)
 	if err != nil {
 		internalError(w, err)
 		return
@@ -124,8 +162,9 @@ func (s *Server) getSubmission(w http.ResponseWriter, r *http.Request) {
 		Status    string     `json:"status"`
 		Verdict   *string    `json:"verdict"`
 		RuntimeMs *int       `json:"runtime_ms"`
+		Message   *string    `json:"message"`
 		Tests     []testJSON `json:"tests"`
-	}{sub.Status, sub.Verdict, sub.RuntimeMs, tests})
+	}{sub.Status, sub.Verdict, sub.RuntimeMs, sub.Message, tests})
 }
 
 // decodeJSON reads the request body into dst and writes a 400 if it can't.

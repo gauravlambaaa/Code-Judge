@@ -1,0 +1,12 @@
+{
+  "title": "Count primes",
+  "statement": "Read one integer n (1 ≤ n ≤ 5,000,000) and print how many prime numbers are less than or equal to n.",
+  "time_limit_ms": 2000,
+  "memory_limit_mb": 256,
+  "test_cases": [
+    { "input": "10\n", "expected_output": "4\n" },
+    { "input": "1\n", "expected_output": "0\n" },
+    { "input": "1000\n", "expected_output": "168\n" },
+    { "input": "5000000\n", "expected_output": "348513\n" }
+  ]
+}

@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>code_judge</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f6f4; --panel: #ffffff; --text: #1f1f1d; --muted: #6b6a66; --border: #e2e1dc;
+    --code-bg: #fafaf8; --accent: #2f6fdb; --on-accent: #ffffff; --focus: #2f6fdb55;
+    --ok: #1e7b34; --ok-bg: #e6f4e9; --bad: #b42318; --bad-bg: #fcebea;
+    --warn: #8f5300; --warn-bg: #fdf1dc; --neutral: #4b4a46; --neutral-bg: #efeee9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141413; --panel: #1d1d1b; --text: #ecebe6; --muted: #a2a19b; --border: #33322e;
+      --code-bg: #181817; --accent: #5b8ff0; --on-accent: #0d0d0c; --focus: #5b8ff066;
+      --ok: #7fd893; --ok-bg: #173020; --bad: #ff8b7c; --bad-bg: #3a1a17;
+      --warn: #f2c26a; --warn-bg: #352812; --neutral: #d0cec7; --neutral-bg: #2a2a27;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+           padding: 14px 24px; background: var(--panel); border-bottom: 1px solid var(--border); }
+  header h1 { margin: 0; font-size: 18px; font-weight: 600; font-family: ui-monospace, Consolas, monospace; }
+  header span { color: var(--muted); font-size: 13px; }
+  main { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: 20px;
+         max-width: 1280px; margin: 0 auto; padding: 20px 24px 40px; }
+  @media (max-width: 880px) { main { grid-template-columns: minmax(0, 1fr); padding: 16px; } }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; }
+  .stack { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
+  label.small, .muted { color: var(--muted); font-size: 13px; }
+  select, button { font: inherit; font-size: 14px; color: var(--text); background: var(--panel);
+                   border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; }
+  select:focus-visible, button:focus-visible, textarea:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+  button { cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; padding: 7px 18px; }
+  button.primary[aria-busy="true"] { opacity: 0.7; cursor: progress; }
+  h2 { margin: 14px 0 4px; font-size: 20px; font-weight: 600; }
+  h3 { margin: 18px 0 6px; font-size: 13px; font-weight: 600; color: var(--muted); }
+  p { margin: 8px 0; }
+  pre, textarea { font-family: ui-monospace, "Cascadia Code", Consolas, Menlo, monospace; font-size: 13.5px;
+                  font-variant-ligatures: none; /* show <= as two characters, not one ≤ symbol */ }
+  pre { margin: 0; padding: 10px 12px; background: var(--code-bg); border: 1px solid var(--border);
+        border-radius: 8px; overflow-x: auto; white-space: pre; }
+  .examples { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; }
+  .toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+  .toolbar .spacer { flex: 1; }
+  kbd { font-family: ui-monospace, Consolas, monospace; font-size: 12px; color: var(--muted);
+        border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  textarea { width: 100%; height: 360px; resize: vertical; padding: 12px 14px; line-height: 1.5;
+             background: var(--code-bg); color: var(--text); border: 1px solid var(--border);
+             border-radius: 8px; tab-size: 4; white-space: pre; overflow: auto; }
+  .error { color: var(--bad); font-size: 13px; min-height: 1.2em; margin: 8px 0 0; }
+  .verdict { display: inline-block; font-size: 20px; font-weight: 700; padding: 4px 12px; border-radius: 8px; }
+  .ok { color: var(--ok); background: var(--ok-bg); }
+  .bad { color: var(--bad); background: var(--bad-bg); }
+  .warn { color: var(--warn); background: var(--warn-bg); }
+  .neutral { color: var(--neutral); background: var(--neutral-bg); }
+  .summary { margin-left: 10px; color: var(--muted); font-size: 14px; }
+  ol.tests { list-style: none; padding: 0; margin: 16px 0 0; display: grid; gap: 6px; }
+  ol.tests li { display: grid; grid-template-columns: 70px 64px 1fr; align-items: center; gap: 8px; font-size: 14px; }
+  .pill { font-size: 12px; font-weight: 700; text-align: center; padding: 2px 0; border-radius: 6px; }
+  .skipped { color: var(--muted); }
+  .message { margin-top: 14px; max-height: 240px; overflow: auto; }
+  .foot { margin-top: 14px; font-size: 12px; color: var(--muted); }
+  .foot a { color: var(--accent); }
+  .waiting { display: flex; align-items: center; gap: 10px; color: var(--muted); }
+  .spinner { width: 16px; height: 16px; border-radius: 50%; border: 2px solid var(--border); border-top-color: var(--accent); }
+  @media (prefers-reduced-motion: no-preference) { .spinner { animation: spin 0.8s linear infinite; } }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<header>
+  <h1>code_judge</h1>
+  <span>Sandboxed judge: Go, PostgreSQL job queue, Docker</span>
+</header>
+
+<main>
+  <section class="panel" aria-labelledby="problem-title">
+    <label class="small" for="problem">Problem</label><br>
+    <select id="problem"></select>
+    <div id="problem-body"></div>
+  </section>
+
+  <div class="stack">
+    <section class="panel" aria-label="Your code">
+      <div class="toolbar">
+        <select id="language" aria-label="Language">
+          <option value="python">Python 3.13</option>
+          <option value="cpp">C++17 (g++ 14)</option>
+          <option value="java">Java 21</option>
+        </select>
+        <select id="example" aria-label="Load an example program"></select>
+        <span class="spacer"></span>
+        <kbd>Ctrl+Enter</kbd>
+        <button id="submit" class="primary">Submit</button>
+      </div>
+      <textarea id="code" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Source code"></textarea>
+      <p id="error" class="error" role="alert"></p>
+    </section>
+
+    <section class="panel" aria-live="polite" aria-label="Result">
+      <div id="result" class="muted">Submit your code to see the verdict here. Each test case runs in its own locked-down container.</div>
+    </section>
+  </div>
+</main>
+
+<script>
+// ---------- Example programs (one click each, to show every verdict) ----------
+// String.raw keeps backslashes like "\n" exactly as written.
+const EXAMPLES = {
+  "Sum of two numbers": {
+    python: [
+      ["Correct", String.raw`a, b = map(int, input().split())
+print(a + b)
+`],
+      ["Wrong answer", String.raw`a, b = map(int, input().split())
+print(a - b)
+`],
+      ["Infinite loop (TLE)", String.raw`while True:
+    pass
+`],
+      ["Memory bomb (MLE)", String.raw`chunks = []
+while True:
+    chunks.append(b"x" * (10 * 1024 * 1024))
+`],
+      ["Crash (RE)", String.raw`a, b = map(int, input().split())
+print(a // 0)
+`],
+      ["Syntax error (CE)", String.raw`def main()
+    print(5)
+`],
+      ["Fork bomb (contained)", String.raw`import os
+while True:
+    os.fork()
+`],
+      ["Tries the internet (blocked)", String.raw`import urllib.request
+urllib.request.urlopen("http://1.1.1.1", timeout=3)
+print(5)
+`],
+    ],
+    cpp: [
+      ["Correct", String.raw`#include <iostream>
+
+int main() {
+    long long a, b;
+    std::cin >> a >> b;
+    std::cout << a + b << "\n";
+}
+`],
+      ["Overflows on test 3 (WA)", String.raw`#include <iostream>
+
+int main() {
+    int a, b;  // int tops out around 2.1 billion
+    std::cin >> a >> b;
+    std::cout << a + b << "\n";
+}
+`],
+      ["Segfault (RE)", String.raw`#include <iostream>
+
+int main() {
+    int* volatile p = nullptr;
+    std::cout << *p << "\n";
+}
+`],
+      ["Does not compile (CE)", String.raw`#include <iostream>
+
+int main() {
+    int a, b
+    std::cin >> a >> b;
+    std::cout << a + b << "\n";
+}
+`],
+    ],
+    java: [
+      ["Correct", String.raw`import java.util.Scanner;
+
+public class Main {
+    public static void main(String[] args) {
+        Scanner in = new Scanner(System.in);
+        long a = in.nextLong(), b = in.nextLong();
+        System.out.println(a + b);
+    }
+}
+`],
+      ["Out of memory (MLE)", String.raw`import java.util.ArrayList;
+import java.util.List;
+
+public class Main {
+    public static void main(String[] args) {
+        List<byte[]> blocks = new ArrayList<>();
+        while (true) blocks.add(new byte[10 << 20]);
+    }
+}
+`],
+    ],
+  },
+  "Count primes": {
+    python: [
+      ["Sieve of Eratosthenes (fast)", String.raw`n = int(input())
+if n < 2:
+    print(0)
+else:
+    sieve = bytearray([1]) * (n + 1)
+    sieve[0] = sieve[1] = 0
+    i = 2
+    while i * i <= n:
+        if sieve[i]:
+            sieve[i * i :: i] = bytes(len(range(i * i, n + 1, i)))
+        i += 1
+    print(sum(sieve))
+`],
+      ["Trial division (too slow)", String.raw`n = int(input())
+count = 0
+for k in range(2, n + 1):
+    d = 2
+    while d * d <= k:
+        if k % d == 0:
+            break
+        d += 1
+    else:
+        count += 1
+print(count)
+`],
+    ],
+    cpp: [
+      ["Sieve of Eratosthenes", String.raw`#include <iostream>
+#include <vector>
+
+int main() {
+    int n;
+    std::cin >> n;
+    std::vector<bool> composite(n + 1, false);
+    int count = 0;
+    for (long long i = 2; i <= n; i++) {
+        if (composite[i]) continue;
+        count++;
+        for (long long j = i * i; j <= n; j += i) composite[j] = true;
+    }
+    std::cout << count << "\n";
+}
+`],
+    ],
+  },
+};
+
+const STARTERS = {
+  python: String.raw`import sys
+
+data = sys.stdin.read().split()
+# Your code here: read from data, print the answer
+`,
+  cpp: String.raw`#include <bits/stdc++.h>
+using namespace std;
+
+int main() {
+    // Your code here: read with cin, print with cout
+    return 0;
+}
+`,
+  java: String.raw`import java.util.*;
+
+public class Main {  // must be called Main
+    public static void main(String[] args) {
+        Scanner in = new Scanner(System.in);
+        // Your code here
+    }
+}
+`,
+};
+
+const VERDICTS = {
+  AC: ["Accepted", "ok"], WA: ["Wrong answer", "bad"], RE: ["Runtime error", "bad"],
+  TLE: ["Time limit exceeded", "warn"], MLE: ["Memory limit exceeded", "warn"],
+  CE: ["Compilation error", "neutral"],
+};
+
+// ---------- State and helpers ----------
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+let problems = [];
+let drafts = {};       // "<problem id>:<language>" -> code, so switching back doesn't lose your work
+let shownKey = null;   // which draft the editor is showing right now
+let busy = false;
+
+function current() { return problems.find((p) => p.id === $("problem").value); }
+function draftKey() { return $("problem").value + ":" + $("language").value; }
+
+function showDraft() {
+  if (shownKey) drafts[shownKey] = $("code").value;
+  shownKey = draftKey();
+  $("code").value = drafts[shownKey] ?? STARTERS[$("language").value];
+}
+
+function fillExamples() {
+  const p = current();
+  const list = (p && EXAMPLES[p.title] && EXAMPLES[p.title][$("language").value]) || [];
+  $("example").innerHTML = list.length
+    ? `<option value="">Load an example program…</option>` + list.map((e, i) => `<option value="${i}">${esc(e[0])}</option>`).join("")
+    : `<option value="">No examples for this language</option>`;
+  $("example").disabled = list.length === 0;
+}
+
+function renderProblem() {
+  const p = current();
+  if (!p) {
+    $("problem-body").innerHTML = `<p class="muted">No problems yet. Start the page with <code>bash scripts/web.sh</code>, which adds the sample problems.</p>`;
+    return;
+  }
+  const secs = (p.time_limit_ms / 1000).toString().replace(/\.0$/, "");
+  $("problem-body").innerHTML = `
+    <h2 id="problem-title">${esc(p.title)}</h2>
+    <p class="muted">Time limit ${secs} s per test · Memory ${p.memory_limit_mb} MB · ${p.test_count} tests</p>
+    <p>${esc(p.statement || "No statement.")}</p>
+    <h3>Example (test 1; the others are hidden)</h3>
+    <div class="examples">
+      <div><div class="muted">Input</div><pre>${esc(p.example.input)}</pre></div>
+      <div><div class="muted">Expected output</div><pre>${esc(p.example.expected_output)}</pre></div>
+    </div>`;
+}
+
+// ---------- Loading problems ----------
+async function loadProblems() {
+  try {
+    const r = await fetch("/problems");
+    problems = await r.json();
+  } catch (e) {
+    $("problem-body").innerHTML = `<p class="error">Couldn't reach the API: ${esc(e.message)}</p>`;
+    return;
+  }
+  $("problem").innerHTML = problems.map((p) => `<option value="${p.id}">${esc(p.title)}</option>`).join("");
+  renderProblem();
+  fillExamples();
+  showDraft();
+}
+
+// ---------- Submitting and polling ----------
+async function submit() {
+  if (busy) return;
+  $("error").textContent = "";
+  const p = current();
+  const code = $("code").value;
+  if (!p) { $("error").textContent = "There's no problem to submit to yet."; return; }
+  if (!code.trim()) { $("error").textContent = "Write some code first."; return; }
+
+  setBusy(true);
+  try {
+    const r = await fetch("/submissions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ problem_id: p.id, language: $("language").value, source_code: code }),
+    });
+    const body = await r.json();
+    if (!r.ok) { $("error").textContent = body.error || "The API refused the submission."; setBusy(false); return; }
+    await poll(body.submission_id, p.test_count);
+  } catch (e) {
+    $("error").textContent = "Couldn't reach the API: " + e.message;
+  }
+  setBusy(false);
+}
+
+function setBusy(on) {
+  busy = on;
+  $("submit").setAttribute("aria-busy", on);
+  $("submit").textContent = on ? "Judging…" : "Submit";
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function poll(id, testCount) {
+  const started = Date.now();
+  for (;;) {
+    const s = await (await fetch("/submissions/" + id)).json();
+    if (s.status === "done" || s.status === "failed") { renderResult(id, s, testCount); return; }
+    const secs = Math.round((Date.now() - started) / 1000);
+    const what = s.status === "pending"
+      ? "In the queue, waiting for a worker…"
+      : "Judging: compiling, then running each test in its own sandbox…";
+    $("result").innerHTML = `<div class="waiting"><span class="spinner"></span>${what} ${secs} s</div>` + foot(id);
+    await sleep(400);
+  }
+}
+
+function renderResult(id, s, testCount) {
+  if (s.status === "failed") {
+    $("result").innerHTML = `<span class="verdict neutral">Judge error</span>
+      <p class="muted">The judge gave up on this submission: the workers judging it kept failing, so it hit the retry limit.</p>` + foot(id);
+    return;
+  }
+  const [name, tone] = VERDICTS[s.verdict] || [s.verdict, "neutral"];
+  const tests = s.tests || [];
+  let summary;
+  if (s.verdict === "AC") summary = `all ${tests.length} tests passed · slowest ${s.runtime_ms} ms`;
+  else if (s.verdict === "CE") summary = "the program never ran";
+  else summary = `on test ${tests[tests.length - 1].test} · slowest ${s.runtime_ms} ms`;
+
+  let rows = tests.map((t) => {
+    const [, tt] = VERDICTS[t.verdict] || ["", "neutral"];
+    return `<li><span>Test ${t.test}</span><span class="pill ${tt}">${t.verdict}</span><span class="muted">${t.runtime_ms} ms</span></li>`;
+  }).join("");
+  for (let n = tests.length + 1; n <= testCount && s.verdict !== "CE"; n++) {
+    rows += `<li class="skipped"><span>Test ${n}</span><span class="pill">–</span><span>not run: an earlier test failed</span></li>`;
+  }
+  const label = s.verdict === "CE" ? "Compiler output" : "What the program printed to stderr";
+  const msg = s.message ? `<h3>${label}</h3><pre class="message">${esc(s.message)}</pre>` : "";
+  $("result").innerHTML = `<span class="verdict ${tone}">${name}</span><span class="summary">${summary}</span>
+    ${rows ? `<ol class="tests">${rows}</ol>` : ""}${msg}` + foot(id);
+}
+
+function foot(id) {
+  return `<div class="foot">Submission ${esc(id.slice(0, 8))} · <a href="/submissions/${esc(id)}" target="_blank" rel="noopener">see the raw API response</a></div>`;
+}
+
+// ---------- Wiring ----------
+$("problem").addEventListener("change", () => { renderProblem(); fillExamples(); showDraft(); });
+$("language").addEventListener("change", () => { fillExamples(); showDraft(); });
+$("example").addEventListener("change", (e) => {
+  const p = current();
+  const ex = EXAMPLES[p.title][$("language").value][e.target.value];
+  if (ex) $("code").value = ex[1];
+  e.target.value = "";
+});
+$("submit").addEventListener("click", submit);
+$("code").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submit(); return; }
+  if (e.key === "Tab" && !e.shiftKey) {   // Tab inserts spaces instead of leaving the editor
+    e.preventDefault();
+    const t = e.target, start = t.selectionStart;
+    t.setRangeText("    ", start, t.selectionEnd, "end");
+  }
+});
+loadProblems();
+</script>
+</body>
+</html>

@@ -48,11 +48,25 @@ type Problem struct {
 	MemoryLimitMb int
 }
 
+// ProblemSummary is what the web page lists: a problem plus its first test
+// case, shown as the example.
+type ProblemSummary struct {
+	ID            string
+	Title         string
+	Statement     string
+	TimeLimitMs   int
+	MemoryLimitMb int
+	TestCount     int
+	ExampleInput  string
+	ExampleOutput string
+}
+
 // Submission is what a client sees when it polls for a result.
 type Submission struct {
 	Status    string
 	Verdict   *string // nil (SQL NULL) until the submission is judged
 	RuntimeMs *int
+	Message   *string      // compiler errors, or the failing test's stderr
 	Tests     []TestResult // one per test that ran, in order
 }
 
@@ -74,7 +88,7 @@ type Job struct {
 
 // CreateProblem inserts a problem and its test cases in one transaction, so a
 // problem can never exist without its tests, or with only some of them.
-func (s *Store) CreateProblem(ctx context.Context, title string, timeLimitMs, memoryLimitMb int, tests []TestCase) (string, error) {
+func (s *Store) CreateProblem(ctx context.Context, title, statement string, timeLimitMs, memoryLimitMb int, tests []TestCase) (string, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return "", err
@@ -85,10 +99,10 @@ func (s *Store) CreateProblem(ctx context.Context, title string, timeLimitMs, me
 
 	var id string
 	err = tx.QueryRow(ctx,
-		`INSERT INTO problems (title, time_limit_ms, memory_limit_mb)
-		 VALUES ($1, $2, $3)
+		`INSERT INTO problems (title, statement, time_limit_ms, memory_limit_mb)
+		 VALUES ($1, $2, $3, $4)
 		 RETURNING id`,
-		title, timeLimitMs, memoryLimitMb,
+		title, statement, timeLimitMs, memoryLimitMb,
 	).Scan(&id)
 	if err != nil {
 		return "", err
@@ -109,6 +123,26 @@ func (s *Store) CreateProblem(ctx context.Context, title string, timeLimitMs, me
 		return "", err
 	}
 	return id, nil
+}
+
+// ListProblems returns the newest problem of each title, alphabetically,
+// each with its first test case as an example.
+func (s *Store) ListProblems(ctx context.Context) ([]ProblemSummary, error) {
+	// DISTINCT ON (title) keeps the first row of each title in the ORDER BY,
+	// which is the newest because of created_at DESC.
+	rows, err := s.pool.Query(ctx,
+		`SELECT DISTINCT ON (p.title)
+		        p.id, p.title, p.statement, p.time_limit_ms, p.memory_limit_mb,
+		        (SELECT count(*) FROM test_cases t WHERE t.problem_id = p.id),
+		        coalesce(ex.input, ''), coalesce(ex.expected_output, '')
+		 FROM problems p
+		 LEFT JOIN test_cases ex ON ex.problem_id = p.id AND ex.ordinal = 1
+		 ORDER BY p.title, p.created_at DESC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[ProblemSummary])
 }
 
 // CreateSubmission puts a submission on the queue. The new row gets
@@ -132,11 +166,11 @@ func (s *Store) CreateSubmission(ctx context.Context, problemID, language, sourc
 func (s *Store) GetSubmission(ctx context.Context, id string) (Submission, error) {
 	var sub Submission
 	err := s.pool.QueryRow(ctx,
-		`SELECT status, verdict, runtime_ms
+		`SELECT status, verdict, runtime_ms, message
 		 FROM submissions
 		 WHERE id = $1`,
 		id,
-	).Scan(&sub.Status, &sub.Verdict, &sub.RuntimeMs)
+	).Scan(&sub.Status, &sub.Verdict, &sub.RuntimeMs, &sub.Message)
 	if errors.Is(err, pgx.ErrNoRows) || isBadReference(err) {
 		return Submission{}, ErrNotFound
 	}
@@ -368,19 +402,20 @@ func (s *Store) LoadProblem(ctx context.Context, problemID string) (Problem, []T
 //
 // It all happens in one transaction, so nobody can ever see a submission
 // marked done with only some of its test results saved.
-func (s *Store) FinishSubmission(ctx context.Context, id, workerID, verdict string, runtimeMs int, tests []TestResult) error {
+func (s *Store) FinishSubmission(ctx context.Context, id, workerID, verdict string, runtimeMs int, message string, tests []TestResult) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
 
+	// NULLIF stores SQL NULL instead of an empty message.
 	tag, err := tx.Exec(ctx,
 		`UPDATE submissions
-		 SET status = 'done', verdict = $3, runtime_ms = $4,
+		 SET status = 'done', verdict = $3, runtime_ms = $4, message = NULLIF($5, ''),
 		     lease_expires_at = NULL, updated_at = now()
 		 WHERE id = $1 AND worker_id = $2 AND status = 'running'`,
-		id, workerID, verdict, runtimeMs,
+		id, workerID, verdict, runtimeMs, message,
 	)
 	if err != nil {
 		return err
