@@ -111,11 +111,21 @@ func (s *Server) getSubmission(w http.ResponseWriter, r *http.Request) {
 		internalError(w, err)
 		return
 	}
+	type testJSON struct {
+		Test      int    `json:"test"`
+		Verdict   string `json:"verdict"`
+		RuntimeMs int    `json:"runtime_ms"`
+	}
+	tests := make([]testJSON, len(sub.Tests)) // never nil, so it's [] in JSON, not null
+	for i, t := range sub.Tests {
+		tests[i] = testJSON{t.Number, t.Verdict, t.RuntimeMs}
+	}
 	writeJSON(w, http.StatusOK, struct {
-		Status    string  `json:"status"`
-		Verdict   *string `json:"verdict"`
-		RuntimeMs *int    `json:"runtime_ms"`
-	}{sub.Status, sub.Verdict, sub.RuntimeMs})
+		Status    string     `json:"status"`
+		Verdict   *string    `json:"verdict"`
+		RuntimeMs *int       `json:"runtime_ms"`
+		Tests     []testJSON `json:"tests"`
+	}{sub.Status, sub.Verdict, sub.RuntimeMs, tests})
 }
 
 // decodeJSON reads the request body into dst and writes a 400 if it can't.

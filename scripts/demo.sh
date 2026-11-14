@@ -75,7 +75,7 @@ for file in "${FILES[@]}"; do
 done
 echo "Submitted ${#FILES[@]} programs. Waiting for verdicts..."
 
-printf '\n%-12s %-8s %s\n' PROGRAM VERDICT RUNTIME
+printf '\n%-16s %-8s %s\n' PROGRAM VERDICT RUNTIME
 for i in "${!FILES[@]}"; do
   file=${FILES[$i]}
   for _ in $(seq 1 120); do # give up after 60 s
@@ -85,9 +85,20 @@ for i in "${!FILES[@]}"; do
     sleep 0.5
   done
   if [ "$status" = done ]; then
-    python3 -c 'import json,sys; r=json.loads(sys.argv[2]); print("%-12s %-8s %s ms" % (sys.argv[1], r["verdict"], r["runtime_ms"]))' "$file" "$resp"
+    python3 -c '
+import json, sys
+r = json.loads(sys.argv[2])
+tests = r["tests"]
+if r["verdict"] == "AC":
+    where = "all %d tests passed" % len(tests)
+elif tests:
+    where = "on test %d" % tests[-1]["test"]  # judging stops at the first failure
+else:
+    where = "no test ran"
+print("%-16s %-8s %5s ms   %s" % (sys.argv[1], r["verdict"], r["runtime_ms"], where))
+' "$file" "$resp"
   else
-    printf '%-12s still %s after 60 s\n' "$file" "$status"
+    printf '%-16s still %s after 60 s\n' "$file" "$status"
   fi
 done
 echo

@@ -136,7 +136,11 @@ func (w *Worker) process(ctx context.Context, job *store.Job) {
 		log.Printf("worker %s: %s %s output:\n%s", w.id, job.ID, res.Verdict, res.Stderr)
 	}
 
-	err = w.store.FinishSubmission(ctx, job.ID, w.id, string(res.Verdict), res.RuntimeMs)
+	tests := make([]store.TestResult, len(res.Tests))
+	for i, t := range res.Tests {
+		tests[i] = store.TestResult{Number: t.Number, Verdict: string(t.Verdict), RuntimeMs: t.RuntimeMs}
+	}
+	err = w.store.FinishSubmission(ctx, job.ID, w.id, string(res.Verdict), res.RuntimeMs, tests)
 	if errors.Is(err, store.ErrLeaseLost) {
 		log.Printf("worker %s: %s is no longer ours (our lease ran out and another worker took it); throwing our result away", w.id, job.ID)
 		return
@@ -145,7 +149,11 @@ func (w *Worker) process(ctx context.Context, job *store.Job) {
 		log.Printf("worker %s: saving verdict for %s failed: %v", w.id, job.ID, err)
 		return
 	}
-	log.Printf("worker %s: %s -> %s (%d ms)", w.id, job.ID, res.Verdict, res.RuntimeMs)
+	if n := res.FailedTest(); n > 0 {
+		log.Printf("worker %s: %s -> %s on test %d (%d ms)", w.id, job.ID, res.Verdict, n, res.RuntimeMs)
+	} else {
+		log.Printf("worker %s: %s -> %s (%d tests, %d ms)", w.id, job.ID, res.Verdict, len(res.Tests), res.RuntimeMs)
+	}
 }
 
 // heartbeat renews the job's lease every heartbeatEvery until ctx is
@@ -177,23 +185,25 @@ func (w *Worker) heartbeat(ctx context.Context, jobID string, lost func()) {
 	}
 }
 
-// judgeJob loads the job's problem and judges it.
+// judgeJob loads the job's problem and judges it against every test case.
 func (w *Worker) judgeJob(ctx context.Context, job *store.Job) (judge.Result, error) {
-	problem, tests, err := w.store.LoadProblem(ctx, job.ProblemID)
+	problem, stored, err := w.store.LoadProblem(ctx, job.ProblemID)
 	if err != nil {
 		return judge.Result{}, fmt.Errorf("loading problem: %w", err)
 	}
-	if len(tests) == 0 {
+	if len(stored) == 0 {
 		return judge.Result{}, fmt.Errorf("problem %s has no test cases", job.ProblemID)
 	}
 
-	// Only the first test case for now. Step 6 runs all of them.
-	tc := tests[0]
+	tests := make([]judge.TestCase, len(stored))
+	for i, tc := range stored {
+		tests[i] = judge.TestCase{Input: tc.Input, Expected: tc.ExpectedOutput}
+	}
 	limits := judge.Limits{
 		Time:     time.Duration(problem.TimeLimitMs) * time.Millisecond,
 		MemoryMB: problem.MemoryLimitMb,
 	}
-	return judge.Judge(ctx, job.Language, job.SourceCode, tc.Input, tc.ExpectedOutput, limits)
+	return judge.Judge(ctx, job.Language, job.SourceCode, tests, limits)
 }
 
 // sleep waits for d, or returns early if ctx is cancelled.

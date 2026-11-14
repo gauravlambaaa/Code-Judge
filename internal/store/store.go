@@ -53,6 +53,14 @@ type Submission struct {
 	Status    string
 	Verdict   *string // nil (SQL NULL) until the submission is judged
 	RuntimeMs *int
+	Tests     []TestResult // one per test that ran, in order
+}
+
+// TestResult is the verdict for one test case of a submission.
+type TestResult struct {
+	Number    int
+	Verdict   string
+	RuntimeMs int
 }
 
 // Job is a submission that a worker has claimed and is about to judge.
@@ -132,6 +140,21 @@ func (s *Store) GetSubmission(ctx context.Context, id string) (Submission, error
 	if errors.Is(err, pgx.ErrNoRows) || isBadReference(err) {
 		return Submission{}, ErrNotFound
 	}
+	if err != nil {
+		return Submission{}, err
+	}
+
+	rows, err := s.pool.Query(ctx,
+		`SELECT test_number, verdict, runtime_ms
+		 FROM submission_results
+		 WHERE submission_id = $1
+		 ORDER BY test_number`,
+		id,
+	)
+	if err != nil {
+		return Submission{}, err
+	}
+	sub.Tests, err = pgx.CollectRows(rows, pgx.RowToStructByPos[TestResult])
 	return sub, err
 }
 
@@ -338,12 +361,21 @@ func (s *Store) LoadProblem(ctx context.Context, problemID string) (Problem, []T
 	return p, tests, nil
 }
 
-// FinishSubmission records the verdict and marks the submission done, but
-// only if the job is still ours. If it isn't (our lease ran out and another
-// worker claimed it), it saves nothing and returns ErrLeaseLost: the other
-// worker's result is the one that counts.
-func (s *Store) FinishSubmission(ctx context.Context, id, workerID, verdict string, runtimeMs int) error {
-	tag, err := s.pool.Exec(ctx,
+// FinishSubmission records the overall verdict and each test's result and
+// marks the submission done, but only if the job is still ours. If it isn't
+// (our lease ran out and another worker claimed it), it saves nothing and
+// returns ErrLeaseLost: the other worker's result is the one that counts.
+//
+// It all happens in one transaction, so nobody can ever see a submission
+// marked done with only some of its test results saved.
+func (s *Store) FinishSubmission(ctx context.Context, id, workerID, verdict string, runtimeMs int, tests []TestResult) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	tag, err := tx.Exec(ctx,
 		`UPDATE submissions
 		 SET status = 'done', verdict = $3, runtime_ms = $4,
 		     lease_expires_at = NULL, updated_at = now()
@@ -354,9 +386,20 @@ func (s *Store) FinishSubmission(ctx context.Context, id, workerID, verdict stri
 		return err
 	}
 	if tag.RowsAffected() == 0 {
-		return ErrLeaseLost
+		return ErrLeaseLost // the deferred Rollback undoes nothing; nothing was changed
 	}
-	return nil
+
+	for _, t := range tests {
+		_, err := tx.Exec(ctx,
+			`INSERT INTO submission_results (submission_id, test_number, verdict, runtime_ms)
+			 VALUES ($1, $2, $3, $4)`,
+			id, t.Number, t.Verdict, t.RuntimeMs,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 // isBadReference reports whether err means an id didn't point at a real row:

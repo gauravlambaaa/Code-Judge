@@ -3,6 +3,8 @@
   "time_limit_ms": 2000,
   "memory_limit_mb": 256,
   "test_cases": [
-    { "input": "2 3\n", "expected_output": "5\n" }
+    { "input": "2 3\n", "expected_output": "5\n" },
+    { "input": "-7 10\n", "expected_output": "3\n" },
+    { "input": "1000000000 2000000000\n", "expected_output": "3000000000\n" }
   ]
 }

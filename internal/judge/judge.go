@@ -1,9 +1,10 @@
-// Package judge compiles and runs a submission against a test case and
-// decides the verdict.
+// Package judge compiles a submission, runs it against a problem's test
+// cases, and decides the verdict.
 package judge
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,14 +25,38 @@ const (
 	CompileError        Verdict = "CE"
 )
 
-// Result is the outcome of judging one test case.
-type Result struct {
-	Verdict   Verdict
-	RuntimeMs int
-	Stderr    string // the program's stderr, or the compiler's errors for a CE
+// TestCase is one input, and the output a correct program prints for it.
+type TestCase struct {
+	Input    string
+	Expected string
 }
 
-// Limits are a problem's resource limits.
+// TestResult is the outcome of one test case.
+type TestResult struct {
+	Number    int // 1 for the first test case, 2 for the second, ...
+	Verdict   Verdict
+	RuntimeMs int
+}
+
+// Result is the outcome of judging a submission.
+type Result struct {
+	Verdict   Verdict      // AC if every test passed; otherwise the first failing test's verdict
+	RuntimeMs int          // the slowest test's running time
+	Stderr    string       // the compiler's errors for a CE, or the failing test's stderr
+	Tests     []TestResult // one per test that ran; judging stops at the first failure
+}
+
+// FailedTest returns the number of the test that decided a failing verdict,
+// or 0 if there isn't one (AC, or a CE where no test ran).
+func (r Result) FailedTest() int {
+	if r.Verdict == Accepted || len(r.Tests) == 0 {
+		return 0
+	}
+	return r.Tests[len(r.Tests)-1].Number
+}
+
+// Limits are a problem's resource limits. The time limit applies to each
+// test case separately.
 type Limits struct {
 	Time     time.Duration
 	MemoryMB int
@@ -97,19 +122,22 @@ func Supported(language string) bool {
 	return ok
 }
 
-// Judge compiles source and runs it on one test case, both inside the
-// sandbox, and classifies what happened.
+// Judge compiles source once, then runs it on each test case in order, all
+// inside the sandbox. The first test that fails decides the verdict, and the
+// remaining tests aren't run. If every test passes, the verdict is AC.
 //
 // It returns an error only when the judge itself failed: Docker is down, a
 // temp file couldn't be written, the worker is shutting down. Anything the
 // submitted code does wrong (doesn't compile, wrong output, crashes, runs
-// too long, uses too much memory) is a verdict, not an error. The difference
-// starts to matter in Step 5: an error means "this job should be tried
-// again", a verdict means "this job is finished".
-func Judge(ctx context.Context, language, source, input, expected string, limits Limits) (Result, error) {
+// too long, uses too much memory) is a verdict, not an error. An error means
+// "this job should be tried again"; a verdict means "this job is finished".
+func Judge(ctx context.Context, language, source string, tests []TestCase, limits Limits) (Result, error) {
 	lang, ok := languages[language]
 	if !ok {
 		return Result{}, fmt.Errorf("language %q is not supported", language)
+	}
+	if len(tests) == 0 {
+		return Result{}, errors.New("no test cases to judge against")
 	}
 
 	dir, err := os.MkdirTemp("", "submission-*")
@@ -129,7 +157,7 @@ func Judge(ctx context.Context, language, source, input, expected string, limits
 		return Result{}, err
 	}
 
-	// Phase 1: compile. If this fails, the program never runs.
+	// Phase 1: compile, once. If this fails, nothing runs.
 	compiled, err := sandbox.Run(ctx, sandbox.Spec{
 		Image:     lang.image,
 		Cmd:       lang.compile,
@@ -148,20 +176,44 @@ func Judge(ctx context.Context, language, source, input, expected string, limits
 		return Result{Verdict: CompileError, Stderr: compiled.Stderr + compiled.Stdout}, nil
 	}
 
-	// Phase 2: run the program on the test input.
+	// Phase 2: run the compiled program on each test case, in order.
+	var res Result
+	for i, tc := range tests {
+		verdict, run, err := runTest(ctx, lang, dir, tc, limits)
+		if err != nil {
+			return Result{}, err
+		}
+		ms := int(run.Elapsed.Milliseconds())
+		res.Tests = append(res.Tests, TestResult{Number: i + 1, Verdict: verdict, RuntimeMs: ms})
+		res.RuntimeMs = max(res.RuntimeMs, ms)
+
+		if verdict != Accepted {
+			// The first failing test decides the verdict. Running the rest
+			// can't change it, so don't spend the time.
+			res.Verdict = verdict
+			res.Stderr = run.Stderr
+			return res, nil
+		}
+	}
+	res.Verdict = Accepted
+	return res, nil
+}
+
+// runTest runs the already-compiled program on one test case and classifies
+// what happened.
+func runTest(ctx context.Context, lang language, dir string, tc TestCase, limits Limits) (Verdict, sandbox.Result, error) {
 	run, err := sandbox.Run(ctx, sandbox.Spec{
 		Image:     lang.image,
 		Cmd:       lang.run,
 		Dir:       dir,
-		Stdin:     input,
+		Stdin:     tc.Input,
 		TimeLimit: limits.Time,
 		MemoryMB:  limits.MemoryMB,
 	})
 	if err != nil {
-		return Result{}, err
+		return "", sandbox.Result{}, err
 	}
 
-	res := Result{RuntimeMs: int(run.Elapsed.Milliseconds()), Stderr: run.Stderr}
 	// The order matters. First, the reasons the program was *stopped*
 	// (time, then memory), and only then whether it crashed on its own:
 	// a program killed for either limit also exits with a non-zero code
@@ -170,15 +222,14 @@ func Judge(ctx context.Context, language, source, input, expected string, limits
 	// out of memory, the time limit is the one it broke first.
 	switch {
 	case run.Killed || run.Elapsed > limits.Time:
-		res.Verdict = TimeLimitExceeded
+		return TimeLimitExceeded, run, nil
 	case run.OOMKilled || (run.ExitCode != 0 && strings.Contains(run.Stderr, lang.oomMessage)):
-		res.Verdict = MemoryLimitExceeded
+		return MemoryLimitExceeded, run, nil
 	case run.ExitCode != 0:
-		res.Verdict = RuntimeError
-	case !outputsMatch(run.Stdout, expected):
-		res.Verdict = WrongAnswer
+		return RuntimeError, run, nil
+	case !outputsMatch(run.Stdout, tc.Expected):
+		return WrongAnswer, run, nil
 	default:
-		res.Verdict = Accepted
+		return Accepted, run, nil
 	}
-	return res, nil
 }
