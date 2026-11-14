@@ -38,7 +38,9 @@
   select:focus-visible, button:focus-visible, textarea:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
   button { cursor: pointer; }
   button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; padding: 7px 18px; }
-  button.primary[aria-busy="true"] { opacity: 0.7; cursor: progress; }
+  button[aria-busy="true"] { opacity: 0.7; cursor: progress; }
+  .stdin-label { display: block; margin-top: 14px; }
+  textarea.stdin { height: 90px; margin-top: 6px; }
   h2 { margin: 14px 0 4px; font-size: 20px; font-weight: 600; }
   h3 { margin: 18px 0 6px; font-size: 13px; font-weight: 600; color: var(--muted); }
   p { margin: 8px 0; }
@@ -98,9 +100,12 @@
         <select id="example" aria-label="Load an example program"></select>
         <span class="spacer"></span>
         <kbd>Ctrl+Enter</kbd>
-        <button id="submit" class="primary">Submit</button>
+        <button id="run" title="Run once on your own input (below) and see what it prints">Run</button>
+        <button id="submit" class="primary" title="Judge against all of the problem's test cases">Submit</button>
       </div>
       <textarea id="code" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Source code"></textarea>
+      <label class="small stdin-label" for="stdin">Input for Run: try your own test. Run shows what your program prints; it doesn't check the answer.</label>
+      <textarea id="stdin" class="stdin" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
       <p id="error" class="error" role="alert"></p>
     </section>
 
@@ -312,6 +317,7 @@ function renderProblem() {
     $("problem-body").innerHTML = `<p class="muted">No problems yet. Start the page with <code>bash scripts/web.sh</code>, which adds the sample problems.</p>`;
     return;
   }
+  $("stdin").value = p.example.input; // start the Run box with the example input
   const secs = (p.time_limit_ms / 1000).toString().replace(/\.0$/, "");
   $("problem-body").innerHTML = `
     <h2 id="problem-title">${esc(p.title)}</h2>
@@ -340,7 +346,11 @@ async function loadProblems() {
 }
 
 // ---------- Submitting and polling ----------
-async function submit() {
+// send queues the code. kind "judge" (Submit) goes to POST /submissions and
+// is judged on every test case; kind "run" (Run) goes to POST /runs and runs
+// once on the input box. Either way the API only queues it, and the page
+// then polls GET /submissions/{id} until a worker has finished it.
+async function send(kind) {
   if (busy) return;
   $("error").textContent = "";
   const p = current();
@@ -348,26 +358,32 @@ async function submit() {
   if (!p) { $("error").textContent = "There's no problem to submit to yet."; return; }
   if (!code.trim()) { $("error").textContent = "Write some code first."; return; }
 
-  setBusy(true);
+  const body = { problem_id: p.id, language: $("language").value, source_code: code };
+  if (kind === "run") body.input = $("stdin").value;
+
+  setBusy(kind);
   try {
-    const r = await fetch("/submissions", {
+    const r = await fetch(kind === "run" ? "/runs" : "/submissions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ problem_id: p.id, language: $("language").value, source_code: code }),
+      body: JSON.stringify(body),
     });
-    const body = await r.json();
-    if (!r.ok) { $("error").textContent = body.error || "The API refused the submission."; setBusy(false); return; }
-    await poll(body.submission_id, p.test_count);
+    const res = await r.json();
+    if (!r.ok) { $("error").textContent = res.error || "The API refused it."; setBusy(null); return; }
+    await poll(res.submission_id, p.test_count);
   } catch (e) {
     $("error").textContent = "Couldn't reach the API: " + e.message;
   }
-  setBusy(false);
+  setBusy(null);
 }
 
-function setBusy(on) {
-  busy = on;
-  $("submit").setAttribute("aria-busy", on);
-  $("submit").textContent = on ? "Judging…" : "Submit";
+// setBusy(kind) marks which button is working ("judge" or "run"); null means idle.
+function setBusy(kind) {
+  busy = kind !== null;
+  $("submit").setAttribute("aria-busy", kind === "judge");
+  $("run").setAttribute("aria-busy", kind === "run");
+  $("submit").textContent = kind === "judge" ? "Judging…" : "Submit";
+  $("run").textContent = kind === "run" ? "Running…" : "Run";
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -380,7 +396,9 @@ async function poll(id, testCount) {
     const secs = Math.round((Date.now() - started) / 1000);
     const what = s.status === "pending"
       ? "In the queue, waiting for a worker…"
-      : "Judging: compiling, then running each test in its own sandbox…";
+      : s.mode === "run"
+        ? "Running: compiling, then running your code on your input in a sandbox…"
+        : "Judging: compiling, then running each test in its own sandbox…";
     $("result").innerHTML = `<div class="waiting"><span class="spinner"></span>${what} ${secs} s</div>` + foot(id);
     await sleep(400);
   }
@@ -392,6 +410,7 @@ function renderResult(id, s, testCount) {
       <p class="muted">The judge gave up on this submission: the workers judging it kept failing, so it hit the retry limit.</p>` + foot(id);
     return;
   }
+  if (s.mode === "run") { renderRun(id, s); return; }
   const [name, tone] = VERDICTS[s.verdict] || [s.verdict, "neutral"];
   const tests = s.tests || [];
   let summary;
@@ -412,6 +431,20 @@ function renderResult(id, s, testCount) {
     ${rows ? `<ol class="tests">${rows}</ol>` : ""}${msg}` + foot(id);
 }
 
+// renderRun shows the result of Run: how the program ended and what it
+// printed. There's nothing to compare against, so there's no AC or WA.
+function renderRun(id, s) {
+  const [name, tone] = s.verdict === "OK" ? ["Finished", "neutral"] : (VERDICTS[s.verdict] || [s.verdict, "neutral"]);
+  const summary = s.verdict === "CE"
+    ? "the program never ran"
+    : `ran in ${s.runtime_ms} ms on your input · Run doesn't check the answer; Submit judges it on all tests`;
+  const output = s.verdict === "CE" ? "" :
+    `<h3>Output</h3><pre class="message">${s.stdout ? esc(s.stdout) : "(no output)"}</pre>`;
+  const label = s.verdict === "CE" ? "Compiler output" : "What the program printed to stderr";
+  const msg = s.message ? `<h3>${label}</h3><pre class="message">${esc(s.message)}</pre>` : "";
+  $("result").innerHTML = `<span class="verdict ${tone}">${name}</span><span class="summary">${summary}</span>${output}${msg}` + foot(id);
+}
+
 function foot(id) {
   return `<div class="foot">Submission ${esc(id.slice(0, 8))} · <a href="/submissions/${esc(id)}" target="_blank" rel="noopener">see the raw API response</a></div>`;
 }
@@ -425,9 +458,10 @@ $("example").addEventListener("change", (e) => {
   if (ex) $("code").value = ex[1];
   e.target.value = "";
 });
-$("submit").addEventListener("click", submit);
+$("submit").addEventListener("click", () => send("judge"));
+$("run").addEventListener("click", () => send("run"));
 $("code").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submit(); return; }
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send("judge"); return; }
   if (e.key === "Tab" && !e.shiftKey) {   // Tab inserts spaces instead of leaving the editor
     e.preventDefault();
     const t = e.target, start = t.selectionStart;

@@ -1,5 +1,6 @@
 // Package judge compiles a submission, runs it against a problem's test
-// cases, and decides the verdict.
+// cases, and decides the verdict. It also runs code once on custom input,
+// for the page's Run button.
 package judge
 
 import (
@@ -23,6 +24,11 @@ const (
 	MemoryLimitExceeded Verdict = "MLE"
 	RuntimeError        Verdict = "RE"
 	CompileError        Verdict = "CE"
+
+	// Finished means the program ran to the end without crashing or hitting
+	// a limit. Run uses it as its "success" result: with custom input there
+	// is no expected output, so it can't say AC or WA.
+	Finished Verdict = "OK"
 )
 
 // TestCase is one input, and the output a correct program prints for it.
@@ -38,12 +44,13 @@ type TestResult struct {
 	RuntimeMs int
 }
 
-// Result is the outcome of judging a submission.
+// Result is the outcome of judging (or running) a submission.
 type Result struct {
-	Verdict   Verdict      // AC if every test passed; otherwise the first failing test's verdict
+	Verdict   Verdict      // Judge: AC, or the first failing test's verdict. Run: OK, TLE, MLE, RE or CE.
 	RuntimeMs int          // the slowest test's running time
-	Stderr    string       // the compiler's errors for a CE, or the failing test's stderr
-	Tests     []TestResult // one per test that ran; judging stops at the first failure
+	Stderr    string       // the compiler's errors for a CE, or the program's stderr
+	Tests     []TestResult // Judge only: one per test that ran; judging stops at the first failure
+	Stdout    string       // Run only: what the program printed
 }
 
 // FailedTest returns the number of the test that decided a failing verdict,
@@ -140,48 +147,28 @@ func Judge(ctx context.Context, language, source string, tests []TestCase, limit
 		return Result{}, errors.New("no test cases to judge against")
 	}
 
-	dir, err := os.MkdirTemp("", "submission-*")
+	dir, ce, err := compile(ctx, lang, source)
 	if err != nil {
 		return Result{}, err
+	}
+	if ce != nil {
+		return *ce, nil // didn't compile, so no test runs
 	}
 	defer os.RemoveAll(dir)
-	// The containers run as "nobody". MkdirTemp makes the directory private
-	// to us (0700). 0777 lets the compiler, running as nobody, write its
-	// output (the C++ binary, Java's .class file) next to the source. The
-	// run step mounts the directory read-only, so the program itself still
-	// can't change anything in it.
-	if err := os.Chmod(dir, 0o777); err != nil {
-		return Result{}, err
-	}
-	if err := os.WriteFile(filepath.Join(dir, lang.fileName), []byte(source), 0o644); err != nil {
-		return Result{}, err
-	}
 
-	// Phase 1: compile, once. If this fails, nothing runs.
-	compiled, err := sandbox.Run(ctx, sandbox.Spec{
-		Image:     lang.image,
-		Cmd:       lang.compile,
-		Dir:       dir,
-		Writable:  true,
-		TimeLimit: compileTimeLimit,
-		MemoryMB:  compileMemoryMB,
-	})
-	if err != nil {
-		return Result{}, err
-	}
-	if compiled.Killed {
-		return Result{Verdict: CompileError, Stderr: "compilation took too long"}, nil
-	}
-	if compiled.ExitCode != 0 {
-		return Result{Verdict: CompileError, Stderr: compiled.Stderr + compiled.Stdout}, nil
-	}
-
-	// Phase 2: run the compiled program on each test case, in order.
 	var res Result
 	for i, tc := range tests {
-		verdict, run, err := runTest(ctx, lang, dir, tc, limits)
+		verdict, run, err := execute(ctx, lang, dir, tc.Input, limits)
 		if err != nil {
 			return Result{}, err
+		}
+		// The program finished normally; only now is its output worth
+		// comparing with the expected output.
+		if verdict == Finished {
+			verdict = Accepted
+			if !outputsMatch(run.Stdout, tc.Expected) {
+				verdict = WrongAnswer
+			}
 		}
 		ms := int(run.Elapsed.Milliseconds())
 		res.Tests = append(res.Tests, TestResult{Number: i + 1, Verdict: verdict, RuntimeMs: ms})
@@ -199,14 +186,97 @@ func Judge(ctx context.Context, language, source string, tests []TestCase, limit
 	return res, nil
 }
 
-// runTest runs the already-compiled program on one test case and classifies
-// what happened.
-func runTest(ctx context.Context, lang language, dir string, tc TestCase, limits Limits) (Verdict, sandbox.Result, error) {
+// Run compiles source and runs it once on input, for the page's "Run"
+// button: you type your own input and see what your program prints. Nothing
+// is compared, so the result is OK (it finished), or TLE, MLE, RE or CE.
+// It uses exactly the same sandbox and limits as Judge.
+func Run(ctx context.Context, language, source, input string, limits Limits) (Result, error) {
+	lang, ok := languages[language]
+	if !ok {
+		return Result{}, fmt.Errorf("language %q is not supported", language)
+	}
+
+	dir, ce, err := compile(ctx, lang, source)
+	if err != nil {
+		return Result{}, err
+	}
+	if ce != nil {
+		return *ce, nil
+	}
+	defer os.RemoveAll(dir)
+
+	verdict, run, err := execute(ctx, lang, dir, input, limits)
+	if err != nil {
+		return Result{}, err
+	}
+	return Result{
+		Verdict:   verdict,
+		RuntimeMs: int(run.Elapsed.Milliseconds()),
+		Stdout:    run.Stdout,
+		Stderr:    run.Stderr,
+	}, nil
+}
+
+// compile writes source into a fresh directory and compiles it inside the
+// sandbox. On success it returns the directory, which the caller must remove
+// when done. If the code doesn't compile, it returns a CE result instead
+// (and has already removed the directory).
+func compile(ctx context.Context, lang language, source string) (dir string, ce *Result, err error) {
+	dir, err = os.MkdirTemp("", "submission-*")
+	if err != nil {
+		return "", nil, err
+	}
+	// Remove the directory on every way out of this function except
+	// success, where the caller still needs it.
+	success := false
+	defer func() {
+		if !success {
+			os.RemoveAll(dir)
+		}
+	}()
+
+	// The containers run as "nobody". MkdirTemp makes the directory private
+	// to us (0700). 0777 lets the compiler, running as nobody, write its
+	// output (the C++ binary, Java's .class file) next to the source. The
+	// run step mounts the directory read-only, so the program itself still
+	// can't change anything in it.
+	if err := os.Chmod(dir, 0o777); err != nil {
+		return "", nil, err
+	}
+	if err := os.WriteFile(filepath.Join(dir, lang.fileName), []byte(source), 0o644); err != nil {
+		return "", nil, err
+	}
+
+	compiled, err := sandbox.Run(ctx, sandbox.Spec{
+		Image:     lang.image,
+		Cmd:       lang.compile,
+		Dir:       dir,
+		Writable:  true,
+		TimeLimit: compileTimeLimit,
+		MemoryMB:  compileMemoryMB,
+	})
+	if err != nil {
+		return "", nil, err
+	}
+	if compiled.Killed {
+		return "", &Result{Verdict: CompileError, Stderr: "compilation took too long"}, nil
+	}
+	if compiled.ExitCode != 0 {
+		return "", &Result{Verdict: CompileError, Stderr: compiled.Stderr + compiled.Stdout}, nil
+	}
+	success = true
+	return dir, nil, nil
+}
+
+// execute runs the already-compiled program once on input and classifies
+// how it ended: TLE, MLE, RE, or Finished if it ran to the end normally. It
+// doesn't look at what the program printed; that's up to the caller.
+func execute(ctx context.Context, lang language, dir, input string, limits Limits) (Verdict, sandbox.Result, error) {
 	run, err := sandbox.Run(ctx, sandbox.Spec{
 		Image:     lang.image,
 		Cmd:       lang.run,
 		Dir:       dir,
-		Stdin:     tc.Input,
+		Stdin:     input,
 		TimeLimit: limits.Time,
 		MemoryMB:  limits.MemoryMB,
 	})
@@ -227,9 +297,7 @@ func runTest(ctx context.Context, lang language, dir string, tc TestCase, limits
 		return MemoryLimitExceeded, run, nil
 	case run.ExitCode != 0:
 		return RuntimeError, run, nil
-	case !outputsMatch(run.Stdout, tc.Expected):
-		return WrongAnswer, run, nil
 	default:
-		return Accepted, run, nil
+		return Finished, run, nil
 	}
 }

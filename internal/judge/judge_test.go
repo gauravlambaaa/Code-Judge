@@ -151,3 +151,39 @@ func TestFirstFailureWins(t *testing.T) {
 		})
 	}
 }
+
+// TestRun checks the "Run with custom input" path: the program runs once on
+// whatever input we give it, and we get back what it printed, with no
+// comparison against an expected answer.
+func TestRun(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow: runs programs in Docker")
+	}
+	if err := exec.Command("docker", "info").Run(); err != nil {
+		t.Skip("docker is not available:", err)
+	}
+	t.Cleanup(sandbox.WaitForCleanup)
+
+	tests := []struct {
+		name, language, source, input string
+		want                          Verdict
+		wantStdout                    string
+	}{
+		{"prints its own result", "python", "a, b = map(int, input().split())\nprint(a * b)\n", "6 7\n", Finished, "42\n"},
+		{"any input, not a test case", "cpp", "#include <iostream>\nint main(){ std::string s; std::cin >> s; std::cout << s.size() << \"\\n\"; }\n", "hello\n", Finished, "5\n"},
+		{"crash still reported", "python", "print(1 // 0)\n", "", RuntimeError, ""},
+		{"compile error still reported", "cpp", "int main() { return }\n", "", CompileError, ""},
+	}
+	limits := Limits{Time: 2 * time.Second, MemoryMB: 256}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res, err := Run(context.Background(), tt.language, tt.source, tt.input, limits)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.Verdict != tt.want || res.Stdout != tt.wantStdout {
+				t.Errorf("got %s with stdout %q, want %s with %q\nstderr: %s", res.Verdict, res.Stdout, tt.want, tt.wantStdout, res.Stderr)
+			}
+		})
+	}
+}

@@ -141,7 +141,8 @@ func (w *Worker) process(ctx context.Context, job *store.Job) {
 	for i, t := range res.Tests {
 		tests[i] = store.TestResult{Number: t.Number, Verdict: string(t.Verdict), RuntimeMs: t.RuntimeMs}
 	}
-	err = w.store.FinishSubmission(ctx, job.ID, w.id, string(res.Verdict), res.RuntimeMs, shortMessage(res.Stderr), tests)
+	err = w.store.FinishSubmission(ctx, job.ID, w.id, string(res.Verdict), res.RuntimeMs,
+		clean(res.Stderr, 4<<10), clean(res.Stdout, 64<<10), tests)
 	if errors.Is(err, store.ErrLeaseLost) {
 		log.Printf("worker %s: %s is no longer ours (our lease ran out and another worker took it); throwing our result away", w.id, job.ID)
 		return
@@ -150,7 +151,9 @@ func (w *Worker) process(ctx context.Context, job *store.Job) {
 		log.Printf("worker %s: saving verdict for %s failed: %v", w.id, job.ID, err)
 		return
 	}
-	if n := res.FailedTest(); n > 0 {
+	if job.Mode == "run" {
+		log.Printf("worker %s: %s -> %s (custom-input run, %d ms)", w.id, job.ID, res.Verdict, res.RuntimeMs)
+	} else if n := res.FailedTest(); n > 0 {
 		log.Printf("worker %s: %s -> %s on test %d (%d ms)", w.id, job.ID, res.Verdict, n, res.RuntimeMs)
 	} else {
 		log.Printf("worker %s: %s -> %s (%d tests, %d ms)", w.id, job.ID, res.Verdict, len(res.Tests), res.RuntimeMs)
@@ -186,33 +189,38 @@ func (w *Worker) heartbeat(ctx context.Context, jobID string, lost func()) {
 	}
 }
 
-// judgeJob loads the job's problem and judges it against every test case.
+// judgeJob loads the job's problem and either judges the code against every
+// test case (a normal submission) or runs it once on the user's own input
+// (a "run"). Both use the problem's time and memory limits.
 func (w *Worker) judgeJob(ctx context.Context, job *store.Job) (judge.Result, error) {
 	problem, stored, err := w.store.LoadProblem(ctx, job.ProblemID)
 	if err != nil {
 		return judge.Result{}, fmt.Errorf("loading problem: %w", err)
 	}
-	if len(stored) == 0 {
-		return judge.Result{}, fmt.Errorf("problem %s has no test cases", job.ProblemID)
-	}
-
-	tests := make([]judge.TestCase, len(stored))
-	for i, tc := range stored {
-		tests[i] = judge.TestCase{Input: tc.Input, Expected: tc.ExpectedOutput}
-	}
 	limits := judge.Limits{
 		Time:     time.Duration(problem.TimeLimitMs) * time.Millisecond,
 		MemoryMB: problem.MemoryLimitMb,
 	}
+
+	if job.Mode == "run" {
+		return judge.Run(ctx, job.Language, job.SourceCode, job.Input, limits)
+	}
+
+	if len(stored) == 0 {
+		return judge.Result{}, fmt.Errorf("problem %s has no test cases", job.ProblemID)
+	}
+	tests := make([]judge.TestCase, len(stored))
+	for i, tc := range stored {
+		tests[i] = judge.TestCase{Input: tc.Input, Expected: tc.ExpectedOutput}
+	}
 	return judge.Judge(ctx, job.Language, job.SourceCode, tests, limits)
 }
 
-// shortMessage turns the compiler's or program's output into something safe
-// to store and show: at most about 4 KB, and only valid UTF-8 with no NUL
+// clean turns the compiler's or program's output into something safe to
+// store and show: at most limit bytes, and only valid UTF-8 with no NUL
 // bytes. A program can print any bytes it likes, and Postgres text columns
 // reject both of those, which would make saving the verdict fail.
-func shortMessage(s string) string {
-	const limit = 4096
+func clean(s string, limit int) string {
 	if len(s) > limit {
 		s = s[:limit] + "\n... (cut)"
 	}

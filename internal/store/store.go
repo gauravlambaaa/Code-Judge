@@ -67,6 +67,8 @@ type Submission struct {
 	Verdict   *string // nil (SQL NULL) until the submission is judged
 	RuntimeMs *int
 	Message   *string      // compiler errors, or the failing test's stderr
+	Mode      string       // "judge" or "run"
+	Stdout    *string      // runs only: what the program printed
 	Tests     []TestResult // one per test that ran, in order
 }
 
@@ -83,7 +85,9 @@ type Job struct {
 	ProblemID  string
 	Language   string
 	SourceCode string
-	Attempt    int // 1 the first time a job is claimed, 2 if it's being retried, ...
+	Mode       string // "judge" (Submit: run the test cases) or "run" (Run: once, on Input)
+	Input      string // the user's own input, for mode "run"
+	Attempt    int    // 1 the first time a job is claimed, 2 if it's being retried, ...
 }
 
 // CreateProblem inserts a problem and its test cases in one transaction, so a
@@ -162,15 +166,33 @@ func (s *Store) CreateSubmission(ctx context.Context, problemID, language, sourc
 	return id, err
 }
 
+// CreateRun queues a "run with custom input" request (the page's Run
+// button). It's a row in the same submissions table as a normal submission,
+// so it goes through exactly the same queue, workers and sandbox; mode = 'run'
+// tells the worker to run the code once on input instead of judging it.
+func (s *Store) CreateRun(ctx context.Context, problemID, language, source, input string) (string, error) {
+	var id string
+	err := s.pool.QueryRow(ctx,
+		`INSERT INTO submissions (problem_id, language, source_code, mode, custom_input)
+		 VALUES ($1, $2, $3, 'run', $4)
+		 RETURNING id`,
+		problemID, language, source, input,
+	).Scan(&id)
+	if isBadReference(err) {
+		return "", ErrNotFound
+	}
+	return id, err
+}
+
 // GetSubmission returns a submission's current status and verdict.
 func (s *Store) GetSubmission(ctx context.Context, id string) (Submission, error) {
 	var sub Submission
 	err := s.pool.QueryRow(ctx,
-		`SELECT status, verdict, runtime_ms, message
+		`SELECT status, verdict, runtime_ms, message, mode, stdout
 		 FROM submissions
 		 WHERE id = $1`,
 		id,
-	).Scan(&sub.Status, &sub.Verdict, &sub.RuntimeMs, &sub.Message)
+	).Scan(&sub.Status, &sub.Verdict, &sub.RuntimeMs, &sub.Message, &sub.Mode, &sub.Stdout)
 	if errors.Is(err, pgx.ErrNoRows) || isBadReference(err) {
 		return Submission{}, ErrNotFound
 	}
@@ -227,7 +249,7 @@ func (s *Store) ClaimNextPending(ctx context.Context, workerID string, lease tim
 	// now() is the database's clock, so lease times never depend on whose
 	// computer's clock is right.
 	err = tx.QueryRow(ctx,
-		`SELECT id, problem_id, language, source_code
+		`SELECT id, problem_id, language, source_code, mode, coalesce(custom_input, '')
 		 FROM submissions
 		 WHERE (status = 'pending'
 		        OR (status = 'running' AND lease_expires_at < now()))
@@ -236,7 +258,7 @@ func (s *Store) ClaimNextPending(ctx context.Context, workerID string, lease tim
 		 LIMIT 1
 		 FOR UPDATE SKIP LOCKED`,
 		maxAttempts,
-	).Scan(&j.ID, &j.ProblemID, &j.Language, &j.SourceCode)
+	).Scan(&j.ID, &j.ProblemID, &j.Language, &j.SourceCode, &j.Mode, &j.Input)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil // every claimable row is taken or locked by someone else
 	}
@@ -282,12 +304,12 @@ func (s *Store) ClaimNextPending(ctx context.Context, workerID string, lease tim
 func (s *Store) claimNextPendingUnsafe(ctx context.Context, workerID string, lease time.Duration) (*Job, error) {
 	var j Job
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, problem_id, language, source_code
+		`SELECT id, problem_id, language, source_code, mode, coalesce(custom_input, '')
 		 FROM submissions
 		 WHERE status = 'pending'
 		 ORDER BY created_at
 		 LIMIT 1`,
-	).Scan(&j.ID, &j.ProblemID, &j.Language, &j.SourceCode)
+	).Scan(&j.ID, &j.ProblemID, &j.Language, &j.SourceCode, &j.Mode, &j.Input)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -402,20 +424,22 @@ func (s *Store) LoadProblem(ctx context.Context, problemID string) (Problem, []T
 //
 // It all happens in one transaction, so nobody can ever see a submission
 // marked done with only some of its test results saved.
-func (s *Store) FinishSubmission(ctx context.Context, id, workerID, verdict string, runtimeMs int, message string, tests []TestResult) error {
+func (s *Store) FinishSubmission(ctx context.Context, id, workerID, verdict string, runtimeMs int, message, stdout string, tests []TestResult) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
 
-	// NULLIF stores SQL NULL instead of an empty message.
+	// NULLIF stores SQL NULL instead of an empty string. stdout is only
+	// passed for runs; for judged submissions it's empty, so it stays NULL.
 	tag, err := tx.Exec(ctx,
 		`UPDATE submissions
-		 SET status = 'done', verdict = $3, runtime_ms = $4, message = NULLIF($5, ''),
+		 SET status = 'done', verdict = $3, runtime_ms = $4,
+		     message = NULLIF($5, ''), stdout = NULLIF($6, ''),
 		     lease_expires_at = NULL, updated_at = now()
 		 WHERE id = $1 AND worker_id = $2 AND status = 'running'`,
-		id, workerID, verdict, runtimeMs, message,
+		id, workerID, verdict, runtimeMs, message, stdout,
 	)
 	if err != nil {
 		return err

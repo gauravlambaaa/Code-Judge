@@ -30,8 +30,48 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /problems", s.listProblems)
 	mux.HandleFunc("POST /problems", s.createProblem)
 	mux.HandleFunc("POST /submissions", s.createSubmission)
-	mux.HandleFunc("GET /submissions/{id}", s.getSubmission)
+	mux.HandleFunc("POST /runs", s.createRun)
+	mux.HandleFunc("GET /submissions/{id}", s.getSubmission) // polls submissions and runs alike
 	return mux
+}
+
+// createRun queues "run my code on this input" (the page's Run button). It
+// never runs anything itself: the API only ever writes rows. A worker picks
+// the run up from the same queue as submissions and runs it in the same
+// sandbox. The client polls GET /submissions/{id} for the output.
+func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ProblemID  string `json:"problem_id"` // the run uses this problem's time and memory limits
+		Language   string `json:"language"`
+		SourceCode string `json:"source_code"`
+		Input      string `json:"input"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if !judge.Supported(req.Language) {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("language %q is not supported", req.Language))
+		return
+	}
+	if req.SourceCode == "" {
+		writeError(w, http.StatusBadRequest, "source_code is empty")
+		return
+	}
+	if len(req.Input) > 64<<10 {
+		writeError(w, http.StatusBadRequest, "input is over 64 KB")
+		return
+	}
+
+	id, err := s.store.CreateRun(r.Context(), req.ProblemID, req.Language, req.SourceCode, req.Input)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusBadRequest, "problem not found")
+		return
+	}
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"submission_id": id})
 }
 
 // index serves the web page. It's compiled into the binary (see web/web.go),
@@ -160,11 +200,13 @@ func (s *Server) getSubmission(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, struct {
 		Status    string     `json:"status"`
+		Mode      string     `json:"mode"` // "judge" or "run"
 		Verdict   *string    `json:"verdict"`
 		RuntimeMs *int       `json:"runtime_ms"`
 		Message   *string    `json:"message"`
+		Stdout    *string    `json:"stdout"` // runs only
 		Tests     []testJSON `json:"tests"`
-	}{sub.Status, sub.Verdict, sub.RuntimeMs, sub.Message, tests})
+	}{sub.Status, sub.Mode, sub.Verdict, sub.RuntimeMs, sub.Message, sub.Stdout, tests})
 }
 
 // decodeJSON reads the request body into dst and writes a 400 if it can't.
