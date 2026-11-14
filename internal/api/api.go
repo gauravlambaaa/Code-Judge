@@ -41,7 +41,7 @@ func (s *Server) Routes() http.Handler {
 // sandbox. The client polls GET /submissions/{id} for the output.
 func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ProblemID  string `json:"problem_id"` // the run uses this problem's time and memory limits
+		ProblemID  string `json:"problem_id"` // optional: its time and memory limits are used; empty means Playground (default limits)
 		Language   string `json:"language"`
 		SourceCode string `json:"source_code"`
 		Input      string `json:"input"`
@@ -112,6 +112,7 @@ func (s *Server) createProblem(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Title         string `json:"title"`
 		Statement     string `json:"statement"`
+		Listed        *bool  `json:"listed"` // optional; false hides it from the page (test problems)
 		TimeLimitMs   int    `json:"time_limit_ms"`
 		MemoryLimitMb int    `json:"memory_limit_mb"`
 		TestCases     []struct {
@@ -138,7 +139,8 @@ func (s *Server) createProblem(w http.ResponseWriter, r *http.Request) {
 		tests[i] = store.TestCase{Input: tc.Input, ExpectedOutput: tc.ExpectedOutput}
 	}
 
-	id, err := s.store.CreateProblem(r.Context(), req.Title, req.Statement, req.TimeLimitMs, req.MemoryLimitMb, tests)
+	listed := req.Listed == nil || *req.Listed // listed unless the request says otherwise
+	id, err := s.store.CreateProblem(r.Context(), req.Title, req.Statement, listed, req.TimeLimitMs, req.MemoryLimitMb, tests)
 	if err != nil {
 		internalError(w, err)
 		return

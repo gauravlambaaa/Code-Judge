@@ -189,17 +189,26 @@ func (w *Worker) heartbeat(ctx context.Context, jobID string, lost func()) {
 	}
 }
 
-// judgeJob loads the job's problem and either judges the code against every
-// test case (a normal submission) or runs it once on the user's own input
-// (a "run"). Both use the problem's time and memory limits.
+// defaultLimits apply to Playground runs, which belong to no problem.
+var defaultLimits = judge.Limits{Time: 2 * time.Second, MemoryMB: 256}
+
+// judgeJob either judges the code against every test case of its problem (a
+// normal submission) or runs it once on the user's own input (a "run").
+// Both use the problem's time and memory limits; a Playground run has no
+// problem and uses defaultLimits.
 func (w *Worker) judgeJob(ctx context.Context, job *store.Job) (judge.Result, error) {
-	problem, stored, err := w.store.LoadProblem(ctx, job.ProblemID)
-	if err != nil {
-		return judge.Result{}, fmt.Errorf("loading problem: %w", err)
-	}
-	limits := judge.Limits{
-		Time:     time.Duration(problem.TimeLimitMs) * time.Millisecond,
-		MemoryMB: problem.MemoryLimitMb,
+	limits := defaultLimits
+	var stored []store.TestCase
+	if job.ProblemID != "" {
+		problem, tcs, err := w.store.LoadProblem(ctx, job.ProblemID)
+		if err != nil {
+			return judge.Result{}, fmt.Errorf("loading problem: %w", err)
+		}
+		limits = judge.Limits{
+			Time:     time.Duration(problem.TimeLimitMs) * time.Millisecond,
+			MemoryMB: problem.MemoryLimitMb,
+		}
+		stored = tcs
 	}
 
 	if job.Mode == "run" {

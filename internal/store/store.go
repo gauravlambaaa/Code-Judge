@@ -82,7 +82,7 @@ type TestResult struct {
 // Job is a submission that a worker has claimed and is about to judge.
 type Job struct {
 	ID         string
-	ProblemID  string
+	ProblemID  string // "" for a Playground run, which belongs to no problem
 	Language   string
 	SourceCode string
 	Mode       string // "judge" (Submit: run the test cases) or "run" (Run: once, on Input)
@@ -92,7 +92,8 @@ type Job struct {
 
 // CreateProblem inserts a problem and its test cases in one transaction, so a
 // problem can never exist without its tests, or with only some of them.
-func (s *Store) CreateProblem(ctx context.Context, title, statement string, timeLimitMs, memoryLimitMb int, tests []TestCase) (string, error) {
+// listed=false keeps it out of the page's problem list (for test problems).
+func (s *Store) CreateProblem(ctx context.Context, title, statement string, listed bool, timeLimitMs, memoryLimitMb int, tests []TestCase) (string, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return "", err
@@ -103,10 +104,10 @@ func (s *Store) CreateProblem(ctx context.Context, title, statement string, time
 
 	var id string
 	err = tx.QueryRow(ctx,
-		`INSERT INTO problems (title, statement, time_limit_ms, memory_limit_mb)
-		 VALUES ($1, $2, $3, $4)
+		`INSERT INTO problems (title, statement, listed, time_limit_ms, memory_limit_mb)
+		 VALUES ($1, $2, $3, $4, $5)
 		 RETURNING id`,
-		title, statement, timeLimitMs, memoryLimitMb,
+		title, statement, listed, timeLimitMs, memoryLimitMb,
 	).Scan(&id)
 	if err != nil {
 		return "", err
@@ -141,6 +142,7 @@ func (s *Store) ListProblems(ctx context.Context) ([]ProblemSummary, error) {
 		        coalesce(ex.input, ''), coalesce(ex.expected_output, '')
 		 FROM problems p
 		 LEFT JOIN test_cases ex ON ex.problem_id = p.id AND ex.ordinal = 1
+		 WHERE p.listed
 		 ORDER BY p.title, p.created_at DESC`,
 	)
 	if err != nil {
@@ -170,11 +172,14 @@ func (s *Store) CreateSubmission(ctx context.Context, problemID, language, sourc
 // button). It's a row in the same submissions table as a normal submission,
 // so it goes through exactly the same queue, workers and sandbox; mode = 'run'
 // tells the worker to run the code once on input instead of judging it.
+//
+// problemID may be "" for a Playground run, which belongs to no problem;
+// it's stored as NULL and the worker uses the default limits.
 func (s *Store) CreateRun(ctx context.Context, problemID, language, source, input string) (string, error) {
 	var id string
 	err := s.pool.QueryRow(ctx,
 		`INSERT INTO submissions (problem_id, language, source_code, mode, custom_input)
-		 VALUES ($1, $2, $3, 'run', $4)
+		 VALUES (NULLIF($1, '')::uuid, $2, $3, 'run', $4)
 		 RETURNING id`,
 		problemID, language, source, input,
 	).Scan(&id)
@@ -249,7 +254,7 @@ func (s *Store) ClaimNextPending(ctx context.Context, workerID string, lease tim
 	// now() is the database's clock, so lease times never depend on whose
 	// computer's clock is right.
 	err = tx.QueryRow(ctx,
-		`SELECT id, problem_id, language, source_code, mode, coalesce(custom_input, '')
+		`SELECT id, coalesce(problem_id::text, ''), language, source_code, mode, coalesce(custom_input, '')
 		 FROM submissions
 		 WHERE (status = 'pending'
 		        OR (status = 'running' AND lease_expires_at < now()))
@@ -304,7 +309,7 @@ func (s *Store) ClaimNextPending(ctx context.Context, workerID string, lease tim
 func (s *Store) claimNextPendingUnsafe(ctx context.Context, workerID string, lease time.Duration) (*Job, error) {
 	var j Job
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, problem_id, language, source_code, mode, coalesce(custom_input, '')
+		`SELECT id, coalesce(problem_id::text, ''), language, source_code, mode, coalesce(custom_input, '')
 		 FROM submissions
 		 WHERE status = 'pending'
 		 ORDER BY created_at

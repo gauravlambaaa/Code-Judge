@@ -23,13 +23,18 @@
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text);
          font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
-           padding: 14px 24px; background: var(--panel); border-bottom: 1px solid var(--border); }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+           padding: 12px 24px; background: var(--panel); border-bottom: 1px solid var(--border); }
   header h1 { margin: 0; font-size: 18px; font-weight: 600; font-family: ui-monospace, Consolas, monospace; }
-  header span { color: var(--muted); font-size: 13px; }
+  header .tagline { color: var(--muted); font-size: 13px; margin-left: auto; }
+  .tabs { display: flex; gap: 4px; margin-left: 8px; }
+  .tabs button { border: none; background: transparent; color: var(--muted); font-weight: 600; padding: 6px 14px; }
+  .tabs button[aria-selected="true"] { background: var(--neutral-bg); color: var(--text); }
   main { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: 20px;
          max-width: 1280px; margin: 0 auto; padding: 20px 24px 40px; }
+  main.solo { grid-template-columns: minmax(0, 1fr); max-width: 960px; } /* Playground: no problem panel */
   @media (max-width: 880px) { main { grid-template-columns: minmax(0, 1fr); padding: 16px; } }
+  .note { margin: 0 0 12px; }
   .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; }
   .stack { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
   label.small, .muted { color: var(--muted); font-size: 13px; }
@@ -79,11 +84,15 @@
 <body>
 <header>
   <h1>code_judge</h1>
-  <span>Sandboxed judge: Go, PostgreSQL job queue, Docker</span>
+  <nav class="tabs" role="tablist" aria-label="Mode">
+    <button role="tab" id="tab-playground" data-mode="playground">Playground</button>
+    <button role="tab" id="tab-problems" data-mode="problems">Problems</button>
+  </nav>
+  <span class="tagline">Sandboxed judge: Go, PostgreSQL job queue, Docker</span>
 </header>
 
-<main>
-  <section class="panel" aria-labelledby="problem-title">
+<main id="main">
+  <section class="panel" id="problem-panel" aria-labelledby="problem-title">
     <label class="small" for="problem">Problem</label><br>
     <select id="problem"></select>
     <div id="problem-body"></div>
@@ -91,6 +100,7 @@
 
   <div class="stack">
     <section class="panel" aria-label="Your code">
+      <p id="playground-note" class="muted note">Playground: write any program, give it any input, and see what it prints. Nothing is judged. It still runs in the same sandbox: 2 s, 256 MB, no network.</p>
       <div class="toolbar">
         <select id="language" aria-label="Language">
           <option value="python">Python 3.13</option>
@@ -99,7 +109,7 @@
         </select>
         <select id="example" aria-label="Load an example program"></select>
         <span class="spacer"></span>
-        <kbd>Ctrl+Enter</kbd>
+        <kbd id="kbd-hint">Ctrl+Enter</kbd>
         <button id="run" title="Run once on your own input (below) and see what it prints">Run</button>
         <button id="submit" class="primary" title="Judge against all of the problem's test cases">Submit</button>
       </div>
@@ -110,7 +120,7 @@
     </section>
 
     <section class="panel" aria-live="polite" aria-label="Result">
-      <div id="result" class="muted">Submit your code to see the verdict here. Each test case runs in its own locked-down container.</div>
+      <div id="result" class="muted"></div>
     </section>
   </div>
 </main>
@@ -254,6 +264,64 @@ int main() {
   },
 };
 
+// Examples for the Playground, where there's no problem to solve.
+const PLAYGROUND_EXAMPLES = {
+  python: [
+    ["Hello, world", String.raw`print("Hello, world")
+`],
+    ["Read all input lines", String.raw`import sys
+
+for number, line in enumerate(sys.stdin, start=1):
+    print(number, line.rstrip("\n")[::-1])  # each line, reversed
+`],
+    ["Infinite loop (TLE)", String.raw`while True:
+    pass
+`],
+    ["Memory bomb (MLE)", String.raw`chunks = []
+while True:
+    chunks.append(b"x" * (10 * 1024 * 1024))
+`],
+    ["Fork bomb (contained)", String.raw`import os
+while True:
+    os.fork()
+`],
+    ["Tries the internet (blocked)", String.raw`import urllib.request
+urllib.request.urlopen("http://1.1.1.1", timeout=3)
+`],
+  ],
+  cpp: [
+    ["Hello, world", String.raw`#include <iostream>
+
+int main() {
+    std::cout << "Hello, world\n";
+}
+`],
+    ["Sum every number in the input", String.raw`#include <iostream>
+
+int main() {
+    long long x, sum = 0;
+    while (std::cin >> x) sum += x;
+    std::cout << sum << "\n";
+}
+`],
+    ["Segfault (RE)", String.raw`#include <iostream>
+
+int main() {
+    int* volatile p = nullptr;
+    std::cout << *p << "\n";
+}
+`],
+  ],
+  java: [
+    ["Hello, world", String.raw`public class Main {
+    public static void main(String[] args) {
+        System.out.println("Hello, world");
+    }
+}
+`],
+  ],
+};
+
 const STARTERS = {
   python: String.raw`import sys
 
@@ -289,22 +357,58 @@ const VERDICTS = {
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 let problems = [];
-let drafts = {};       // "<problem id>:<language>" -> code, so switching back doesn't lose your work
+let drafts = {};       // "<problem id or playground>:<language>" -> code, so switching back doesn't lose your work
 let shownKey = null;   // which draft the editor is showing right now
+let stdinDrafts = {};  // the Run input box, kept separately for each mode
 let busy = false;
+let mode = "playground"; // "playground" (just run code) or "problems" (solve and submit)
+try { mode = localStorage.getItem("mode") === "problems" ? "problems" : "playground"; } catch (e) {}
 
-function current() { return problems.find((p) => p.id === $("problem").value); }
-function draftKey() { return $("problem").value + ":" + $("language").value; }
+function current() { return mode === "problems" ? problems.find((p) => p.id === $("problem").value) : undefined; }
+function draftKey() { return (mode === "problems" ? $("problem").value : "playground") + ":" + $("language").value; }
 
 function showDraft() {
   if (shownKey) drafts[shownKey] = $("code").value;
   shownKey = draftKey();
-  $("code").value = drafts[shownKey] ?? STARTERS[$("language").value];
+  const lang = $("language").value;
+  const starter = mode === "playground" ? PLAYGROUND_EXAMPLES[lang][0][1] : STARTERS[lang];
+  $("code").value = drafts[shownKey] ?? starter;
+}
+
+// examplesNow lists the example programs for the current mode, problem and language.
+function examplesNow() {
+  const lang = $("language").value;
+  if (mode === "playground") return PLAYGROUND_EXAMPLES[lang] || [];
+  const p = current();
+  return (p && EXAMPLES[p.title] && EXAMPLES[p.title][lang]) || [];
+}
+
+// setMode switches between the Playground and Problems tabs.
+function setMode(m) {
+  stdinDrafts[mode] = $("stdin").value;
+  mode = m;
+  try { localStorage.setItem("mode", m); } catch (e) {}
+  const playground = m === "playground";
+  $("tab-playground").setAttribute("aria-selected", playground);
+  $("tab-problems").setAttribute("aria-selected", !playground);
+  $("main").classList.toggle("solo", playground);
+  $("problem-panel").hidden = playground;
+  $("playground-note").hidden = !playground;
+  $("submit").hidden = playground;       // nothing to judge in the Playground
+  $("run").classList.toggle("primary", playground);
+  $("kbd-hint").textContent = playground ? "Ctrl+Enter to run" : "Ctrl+Enter to submit";
+  $("result").className = "muted";
+  $("result").textContent = playground
+    ? "Click Run to see what your program prints for your input."
+    : "Submit to judge your code against every test case. Each test runs in its own locked-down container.";
+  if (playground) $("stdin").value = stdinDrafts.playground ?? "";
+  else renderProblem();
+  fillExamples();
+  showDraft();
 }
 
 function fillExamples() {
-  const p = current();
-  const list = (p && EXAMPLES[p.title] && EXAMPLES[p.title][$("language").value]) || [];
+  const list = examplesNow();
   $("example").innerHTML = list.length
     ? `<option value="">Load an example program…</option>` + list.map((e, i) => `<option value="${i}">${esc(e[0])}</option>`).join("")
     : `<option value="">No examples for this language</option>`;
@@ -340,9 +444,7 @@ async function loadProblems() {
     return;
   }
   $("problem").innerHTML = problems.map((p) => `<option value="${p.id}">${esc(p.title)}</option>`).join("");
-  renderProblem();
-  fillExamples();
-  showDraft();
+  setMode(mode);
 }
 
 // ---------- Submitting and polling ----------
@@ -353,12 +455,13 @@ async function loadProblems() {
 async function send(kind) {
   if (busy) return;
   $("error").textContent = "";
-  const p = current();
+  const p = current(); // undefined in the Playground
   const code = $("code").value;
-  if (!p) { $("error").textContent = "There's no problem to submit to yet."; return; }
+  if (mode === "problems" && !p) { $("error").textContent = "There's no problem to submit to yet."; return; }
   if (!code.trim()) { $("error").textContent = "Write some code first."; return; }
 
-  const body = { problem_id: p.id, language: $("language").value, source_code: code };
+  // A Playground run has no problem: problem_id "" tells the API that.
+  const body = { problem_id: p ? p.id : "", language: $("language").value, source_code: code };
   if (kind === "run") body.input = $("stdin").value;
 
   setBusy(kind);
@@ -370,7 +473,7 @@ async function send(kind) {
     });
     const res = await r.json();
     if (!r.ok) { $("error").textContent = res.error || "The API refused it."; setBusy(null); return; }
-    await poll(res.submission_id, p.test_count);
+    await poll(res.submission_id, p ? p.test_count : 0);
   } catch (e) {
     $("error").textContent = "Couldn't reach the API: " + e.message;
   }
@@ -437,7 +540,8 @@ function renderRun(id, s) {
   const [name, tone] = s.verdict === "OK" ? ["Finished", "neutral"] : (VERDICTS[s.verdict] || [s.verdict, "neutral"]);
   const summary = s.verdict === "CE"
     ? "the program never ran"
-    : `ran in ${s.runtime_ms} ms on your input · Run doesn't check the answer; Submit judges it on all tests`;
+    : `ran in ${s.runtime_ms} ms on your input` +
+      (mode === "problems" ? " · Run doesn't check the answer; Submit judges it on all tests" : "");
   const output = s.verdict === "CE" ? "" :
     `<h3>Output</h3><pre class="message">${s.stdout ? esc(s.stdout) : "(no output)"}</pre>`;
   const label = s.verdict === "CE" ? "Compiler output" : "What the program printed to stderr";
@@ -453,15 +557,20 @@ function foot(id) {
 $("problem").addEventListener("change", () => { renderProblem(); fillExamples(); showDraft(); });
 $("language").addEventListener("change", () => { fillExamples(); showDraft(); });
 $("example").addEventListener("change", (e) => {
-  const p = current();
-  const ex = EXAMPLES[p.title][$("language").value][e.target.value];
+  const ex = examplesNow()[e.target.value];
   if (ex) $("code").value = ex[1];
   e.target.value = "";
 });
+$("tab-playground").addEventListener("click", () => { if (!busy) setMode("playground"); });
+$("tab-problems").addEventListener("click", () => { if (!busy) setMode("problems"); });
 $("submit").addEventListener("click", () => send("judge"));
 $("run").addEventListener("click", () => send("run"));
 $("code").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send("judge"); return; }
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {   // Ctrl+Enter: Run in the Playground, Submit on a problem
+    e.preventDefault();
+    send(mode === "playground" ? "run" : "judge");
+    return;
+  }
   if (e.key === "Tab" && !e.shiftKey) {   // Tab inserts spaces instead of leaving the editor
     e.preventDefault();
     const t = e.target, start = t.selectionStart;
